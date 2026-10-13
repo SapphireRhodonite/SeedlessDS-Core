@@ -39,10 +39,98 @@ extern void gpu2d_planes_split_interleaved_masked_1(uint8_t *dest, uint8_t *quar
 
 
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+
+static inline void store_rgb_planes16(uint8_t *dest, uint16x8_t low,
+                                       uint16x8_t high)
+{
+    const uint8x16_t mask = vdupq_n_u8(0x3eu);
+    uint8x16_t red = vcombine_u8(vmovn_u16(low), vmovn_u16(high));
+    uint8x16_t green = vcombine_u8(vshrn_n_u16(low, 4), vshrn_n_u16(high, 4));
+    uint8x16_t blue = vshrq_n_u8(vcombine_u8(vshrn_n_u16(low, 8), vshrn_n_u16(high, 8)), 1);
+    vst1q_u8(dest, vandq_u8(vshlq_n_u8(red, 1), mask));
+    vst1q_u8(dest + 0x100u, vandq_u8(green, mask));
+    vst1q_u8(dest + 0x200u, vandq_u8(blue, mask));
+}
+
+static int try_split_rgb_planes_with_backdrop(uint8_t *dest, const uint16_t *origin,
+                                             uint16_t color, const uint32_t *mask)
+{
+    uintptr_t output = (uintptr_t)dest, input = (uintptr_t)origin;
+    uintptr_t masks = (uintptr_t)mask;
+    if ((output >= input ? output - input < 0x200u : input - output < 0x300u)
+        || (output >= masks ? output - masks < 0x20u : masks - output < 0x300u))
+        return 0;
+
+    static const uint16_t bits[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const uint16x8_t low_bits = vld1q_u16(bits);
+    const uint16x8_t high_bits = vshlq_n_u16(low_bits, 8);
+    const uint16x8_t backdrop = vdupq_n_u16(color);
+    for (unsigned i = 0; i < 0x100u; i += 32u) {
+        uint32_t word = mask[i >> 5];
+        if (word == UINT32_MAX) {
+            memset(dest + i, (color & 0x1fu) << 1, 32u);
+            memset(dest + i + 0x100u, (color >> 4) & 0x3eu, 32u);
+            memset(dest + i + 0x200u, (color >> 9) & 0x3eu, 32u);
+            continue;
+        }
+        uint16x8x4_t pixels = vld1q_u16_x4(origin + i);
+        if (word != 0u) {
+            uint16x8_t low = vdupq_n_u16((uint16_t)word);
+            uint16x8_t high = vdupq_n_u16((uint16_t)(word >> 16));
+            pixels.val[0] = vbslq_u16(vtstq_u16(low, low_bits), backdrop, pixels.val[0]);
+            pixels.val[1] = vbslq_u16(vtstq_u16(low, high_bits), backdrop, pixels.val[1]);
+            pixels.val[2] = vbslq_u16(vtstq_u16(high, low_bits), backdrop, pixels.val[2]);
+            pixels.val[3] = vbslq_u16(vtstq_u16(high, high_bits), backdrop, pixels.val[3]);
+        }
+        store_rgb_planes16(dest + i, pixels.val[0], pixels.val[1]);
+        store_rgb_planes16(dest + i + 16u, pixels.val[2], pixels.val[3]);
+    }
+    return 1;
+}
+#endif
+
+#ifdef __ARM_NEON
+static int compose_ranges_overlap(const void *a, size_t asize, const void *b, size_t bsize)
+{
+    uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+    return x <= y ? y - x < asize : x - y < bsize;
+}
+
+static void compose_copy_full_overlay(uint8_t *dst, uint8_t *quarter, const uint8_t *rgba)
+{
+    for (unsigned i = 0; i < 256u; i += 16u) {
+        uint8x16x4_t color = vld4q_u8(rgba + i * 4u);
+        vst1q_u8(dst + i,color.val[0]);
+        vst1q_u8(dst + 256u + i,color.val[1]);
+        vst1q_u8(dst + 512u + i,color.val[2]);
+        if (quarter)
+            vst1q_u8(quarter + i,color.val[3]);
+    }
+}
+#endif
+
 void gpu2d_compose_blend_marked_layers(uint8_t *ctx, void *output, uint8_t *layers,
                         uint8_t *lists, void *extra, void *extra2,
                         uint32_t mask)
 {
+
+    const uint32_t has_overlay = (extra != 0) & mask;
+#ifdef __ARM_NEON
+    if (has_overlay && (mask & ~0x1fu) == 0 &&
+        vminvq_u32(vandq_u32(vld1q_u32((const uint32_t *)layers),
+                             vld1q_u32((const uint32_t *)(layers + 16u)))) == UINT32_MAX &&
+        !compose_ranges_overlap(output, 768u, extra, 1024u) &&
+        !compose_ranges_overlap(output, 768u, layers, 32u) &&
+        (extra2 == 0 ||
+         (!compose_ranges_overlap(output, 768u, extra2, 256u) &&
+          !compose_ranges_overlap(extra2, 256u, extra, 1024u) &&
+          !compose_ranges_overlap(extra2, 256u, layers, 32u)))) {
+        compose_copy_full_overlay(output,extra2,extra);
+        return;
+    }
+#endif
 
     uint8_t stack[544] __attribute__((aligned(16)));
     uint8_t *buf = stack;
@@ -75,6 +163,12 @@ void gpu2d_compose_blend_marked_layers(uint8_t *ctx, void *output, uint8_t *laye
 
     uint8_t *org = (uint8_t *)rd_ptr(ctx + SOURCE);
 
+#ifdef __ARM_NEON
+    if (done != 0 && try_split_rgb_planes_with_backdrop((uint8_t *)output,
+            (const uint16_t *)acc, rd16(org), (const uint32_t *)(layers + ADJUST)))
+        goto apply_overlay;
+#endif
+
     if (done != 0) {
         gpu2d_line_apply_flat_color_masked((uint16_t *)buf, (const uint16_t *)acc, rd16(org),
                            (const uint32_t *)(layers + ADJUST));
@@ -94,7 +188,10 @@ void gpu2d_compose_blend_marked_layers(uint8_t *ctx, void *output, uint8_t *laye
 
     gpu2d_compose_split_rgb_planes((uint8_t *)output, (const uint16_t *)buf);
 
-    if (extra != 0 && (mask & 1))
+#ifdef __ARM_NEON
+apply_overlay:
+#endif
+    if (has_overlay)
         gpu2d_planes_split_interleaved_masked((uint8_t *)output, (uint8_t *)extra2,
                            (const uint8_t *)extra, (const uint16_t *)layers);
 }
@@ -816,61 +913,43 @@ static V4 bsl(uint32_t mask, V4 height, V4 low) {
 #endif
 
 int gpu2d_compose_fold_alpha_summary(uint8_t *dest, const void *origin) {
+#ifdef __ARM_NEON
 
+    uint8_t summary[32];
+    const uint8x16_t weights = {1, 2, 4, 8, 16, 32, 64, 128,
+                               1, 2, 4, 8, 16, 32, 64, 128};
+    uint8x16_t any = vdupq_n_u8(0);
+    uint8x16_t partial = vdupq_n_u8(0);
+    for (unsigned i = 0; i < 16; ++i) {
+        const uint8_t *src = (const uint8_t *)origin + i * 64u;
+        uint8x16_t rgba0 = vld1q_u8(src);
+        uint8x16_t rgba1 = vld1q_u8(src + 16);
+        uint8x16_t rgba2 = vld1q_u8(src + 32);
+        uint8x16_t rgba3 = vld1q_u8(src + 48);
+        uint16x8_t low = vuzp2q_u16(vreinterpretq_u16_u8(rgba0),
+                                   vreinterpretq_u16_u8(rgba1));
+        uint16x8_t high = vuzp2q_u16(vreinterpretq_u16_u8(rgba2),
+                                    vreinterpretq_u16_u8(rgba3));
+        uint8x16_t alpha = vuzp2q_u8(vreinterpretq_u8_u16(low),
+                                    vreinterpretq_u8_u16(high));
+        uint8x16_t present = vmvnq_u8(vceqzq_u8(alpha));
+        any = vorrq_u8(any, present);
+        partial = vorrq_u8(partial,
+            vbicq_u8(present, vceqq_u8(alpha, vdupq_n_u8(31))));
+        uint8x16_t packed = vandq_u8(present, weights);
+        packed = vpaddq_u8(packed, packed);
+        packed = vpaddq_u8(packed, packed);
+        packed = vpaddq_u8(packed, packed);
+        uint16_t bits = vgetq_lane_u16(vreinterpretq_u16_u8(packed), 0);
+        memcpy(summary + i * 2u, &bits, sizeof(bits));
+    }
+    memcpy(dest, summary, sizeof(summary));
+    if (vmaxvq_u8(partial) != 0) return 2;
+    return vmaxvq_u8(any) != 0 ? 16 : 0;
+#else
     _Alignas(16) uint8_t local[LOCAL];
     gpu2d_compose_extract_alpha_plane(local, origin);
 
-#ifdef __ARM_NEON
-
-    uint32x4_t acc_a = vdupq_n_u32(0);
-    uint32x4_t acc_b = vdupq_n_u32(0);
-    const uint32x4_t k_f0 = vdupq_n_u32(0xf0f0f0f0u);
-    const uint32x4_t k_1f = vdupq_n_u32(0x1f1f1f1fu);
-    const uint32x4_t k_11 = vdupq_n_u32(0x11111111u);
-
-    for (int v = 0; v < ROUNDS; v++) {
-        uint32x4x2_t pair = vld2q_u32((const uint32_t *)(local + v * 32));
-        uint32x4_t even = pair.val[0], odd = pair.val[1];
-
-        uint32x4_t a = vorrq_u32(vshrq_n_u32(even, 4), even);
-        uint32x4_t b = vorrq_u32(vshlq_n_u32(odd, 4), odd);
-        uint32x4_t m1 = vbslq_u32(k_f0, b, a);
-
-        uint32x4_t pe = veorq_u32(even, k_1f);
-        uint32x4_t ie = veorq_u32(odd, k_1f);
-        uint32x4_t c  = vorrq_u32(vshrq_n_u32(pe, 4), pe);
-        uint32x4_t dd = vorrq_u32(vshlq_n_u32(ie, 4), ie);
-        uint32x4_t m2 = vbslq_u32(k_f0, dd, c);
-
-        uint32x4_t x = vorrq_u32(vshrq_n_u32(m1, 2), m1);
-        uint32x4_t y = vorrq_u32(vshrq_n_u32(m2, 2), m2);
-        x = vorrq_u32(vshrq_n_u32(x, 1), x);
-        y = vorrq_u32(vshrq_n_u32(y, 1), y);
-        x = vandq_u32(x, k_11);
-        y = vandq_u32(y, k_11);
-        x = vorrq_u32(vshrq_n_u32(x, 7), x);
-        y = vorrq_u32(vshrq_n_u32(y, 7), y);
-        x = vorrq_u32(vshrq_n_u32(x, 14), x);
-        y = vorrq_u32(vshrq_n_u32(y, 14), y);
-
-        uint16x4_t x16 = vmovn_u32(x);
-        uint8x8_t  x8  = vmovn_u16(vcombine_u16(x16, x16));
-        uint8_t four[8];
-        vst1_u8(four, x8);
-        memcpy(dest + v * 4, four, 4);
-
-        acc_b = vorrq_u32(acc_b, vandq_u32(y, x));
-        acc_a = vorrq_u32(acc_a, x);
-    }
-    {
-        uint32x2_t ra = vorr_u32(vget_low_u32(acc_a), vget_high_u32(acc_a));
-        uint32x2_t rb = vorr_u32(vget_low_u32(acc_b), vget_high_u32(acc_b));
-        uint32_t ta = vget_lane_u32(ra, 0) | vget_lane_u32(ra, 1);
-        uint32_t tb = vget_lane_u32(rb, 0) | vget_lane_u32(rb, 1);
-        if (tb != 0) return 2;
-        return ta != 0 ? 16 : 0;
-    }
-#else
     V4 acc_a = {{0, 0, 0, 0}};
     V4 acc_b = {{0, 0, 0, 0}};
 
@@ -1221,20 +1300,22 @@ extern void gpu2d_compose_pack_rgba_to_rgb15_18(uint8_t *ctx, uint8_t *dst, cons
 static void pack(uint8_t *d, const uint8_t *s)
 {
 #ifdef __ARM_NEON
-
-    const uint32x4_t m0 = vreinterpretq_u32_u16(vdupq_n_u16(0x0001));
-    const uint32x4_t m1 = vreinterpretq_u32_u16(vdupq_n_u16(0x0004));
-    const uint32x4_t m2 = vreinterpretq_u32_u16(vdupq_n_u16(0x0010));
-    const uint32x4_t m3 = vreinterpretq_u32_u16(vdupq_n_u16(0x0040));
+    const uint8x16_t weights = {1, 2, 4, 8, 16, 32, 64, 128,
+                               1, 2, 4, 8, 16, 32, 64, 128};
+    const int16x8_t zero = vdupq_n_s16(0);
     for (uint32_t i = 0; i < 8; i++) {
-        uint32x4x4_t q = vld4q_u32((const uint32_t *)(s + (size_t)i * 64));
-        uint32x4_t v = vorrq_u32(vorrq_u32(vandq_u32(vshrq_n_u32(q.val[0], 15), m0),
-                                           vandq_u32(vshrq_n_u32(q.val[1], 13), m1)),
-                                 vorrq_u32(vandq_u32(vshrq_n_u32(q.val[2], 11), m2),
-                                           vandq_u32(vshrq_n_u32(q.val[3], 9), m3)));
-        v = vorrq_u32(vshrq_n_u32(v, 15), v);
-        uint8x8_t b = vmovn_u16(vcombine_u16(vmovn_u32(v), vdup_n_u16(0)));
-        vst1_lane_u32((uint32_t *)(d + (size_t)i * 4), vreinterpret_u32_u8(b), 0);
+        const uint8_t *src = s + (size_t)i * 64;
+        uint16x8_t a = vcltq_s16(vreinterpretq_s16_u8(vld1q_u8(src)), zero);
+        uint16x8_t b = vcltq_s16(vreinterpretq_s16_u8(vld1q_u8(src + 16)), zero);
+        uint16x8_t c = vcltq_s16(vreinterpretq_s16_u8(vld1q_u8(src + 32)), zero);
+        uint16x8_t e = vcltq_s16(vreinterpretq_s16_u8(vld1q_u8(src + 48)), zero);
+        uint8x16_t low = vandq_u8(vcombine_u8(vmovn_u16(a), vmovn_u16(b)), weights);
+        uint8x16_t high = vandq_u8(vcombine_u8(vmovn_u16(c), vmovn_u16(e)), weights);
+        uint8x16_t sums = vpaddq_u8(low, high);
+        sums = vpaddq_u8(sums, sums);
+        sums = vpaddq_u8(sums, sums);
+        vst1_lane_u32((uint32_t *)(d + (size_t)i * 4),
+                      vreinterpret_u32_u8(vget_low_u8(sums)), 0);
     }
 #else
     for (uint32_t i = 0; i < 32; i++) {
@@ -1249,13 +1330,93 @@ static void pack(uint8_t *d, const uint8_t *s)
 }
 #define SCALE_MAX 8u
 
-static uint8_t *permute_to_modn(uint8_t *three)
+typedef struct {
+    uint8_t mask[16][32];
+    uint32_t mode[16];
+} compose_alpha_summaries;
+
+#ifdef __ARM_NEON
+static void compose_summarize_sixteen(uint8_t *dest,
+                                     uint32x4_t a, uint32x4_t b,
+                                     uint32x4_t c, uint32x4_t d,
+                                     uint8x16_t *any, uint8x16_t *partial)
 {
+    const uint8x16_t weights = {1, 2, 4, 8, 16, 32, 64, 128,
+                               1, 2, 4, 8, 16, 32, 64, 128};
+    uint16x8_t low = vuzp2q_u16(vreinterpretq_u16_u32(a), vreinterpretq_u16_u32(b));
+    uint16x8_t high = vuzp2q_u16(vreinterpretq_u16_u32(c), vreinterpretq_u16_u32(d));
+    uint8x16_t alpha = vuzp2q_u8(vreinterpretq_u8_u16(low), vreinterpretq_u8_u16(high));
+    uint8x16_t present = vmvnq_u8(vceqzq_u8(alpha));
+    *any = vorrq_u8(*any, alpha);
+    *partial = vorrq_u8(*partial, vbicq_u8(alpha, vceqq_u8(alpha, vdupq_n_u8(31))));
+    uint8x16_t packed = vandq_u8(present, weights);
+    packed = vpaddq_u8(packed, packed);
+    packed = vpaddq_u8(packed, packed);
+    packed = vpaddq_u8(packed, packed);
+    uint16_t bits = vgetq_lane_u16(vreinterpretq_u16_u8(packed), 0);
+    memcpy(dest, &bits, sizeof(bits));
+}
+
+static void compose_permute_and_summarize_four(uint8_t *dest, const uint8_t *source,
+                                              compose_alpha_summaries *summaries)
+{
+    for (unsigned row = 0; row < 4u; ++row) {
+        for (unsigned half = 0; half < 2u; ++half) {
+            const uint32_t *src = (const uint32_t *)(source + row * 0x1000u + half * 0x800u);
+            const unsigned even = row * 4u + half, odd = even + 2u;
+            uint32_t *out_even = (uint32_t *)(dest + even * 0x400u);
+            uint32_t *out_odd = (uint32_t *)(dest + odd * 0x400u);
+            uint8x16_t any_even = vdupq_n_u8(0), partial_even = vdupq_n_u8(0);
+            uint8x16_t any_odd = vdupq_n_u8(0), partial_odd = vdupq_n_u8(0);
+            for (unsigned i = 0; i < 256u; i += 16u) {
+                uint32x4x2_t a = vld2q_u32(src + i * 2u);
+                uint32x4x2_t b = vld2q_u32(src + i * 2u + 8u);
+                uint32x4x2_t c = vld2q_u32(src + i * 2u + 16u);
+                uint32x4x2_t d = vld2q_u32(src + i * 2u + 24u);
+                vst1q_u32(out_even + i, a.val[0]);
+                vst1q_u32(out_odd + i, a.val[1]);
+                vst1q_u32(out_even + i + 4u, b.val[0]);
+                vst1q_u32(out_odd + i + 4u, b.val[1]);
+                vst1q_u32(out_even + i + 8u, c.val[0]);
+                vst1q_u32(out_odd + i + 8u, c.val[1]);
+                vst1q_u32(out_even + i + 12u, d.val[0]);
+                vst1q_u32(out_odd + i + 12u, d.val[1]);
+                compose_summarize_sixteen(summaries->mask[even] + i / 8u,
+                    a.val[0], b.val[0], c.val[0], d.val[0], &any_even, &partial_even);
+                compose_summarize_sixteen(summaries->mask[odd] + i / 8u,
+                    a.val[1], b.val[1], c.val[1], d.val[1], &any_odd, &partial_odd);
+            }
+            summaries->mode[even] = vmaxvq_u8(partial_even) ? 2u : (vmaxvq_u8(any_even) ? 16u : 0u);
+            summaries->mode[odd] = vmaxvq_u8(partial_odd) ? 2u : (vmaxvq_u8(any_odd) ? 16u : 0u);
+        }
+    }
+}
+#endif
+
+static uint8_t *permute_to_modn(uint8_t *three, unsigned summarize,
+                                 const compose_alpha_summaries **summaries)
+{
+    *summaries = 0;
     const unsigned N = recon_scale_output();
     if (!three || !recon_native || N <= 2u) return three;
     static __thread uint8_t row_modn[SCALE_MAX * SCALE_MAX * 0x400];
     uint8_t *row_modn_p = row_modn;
     __asm__ __volatile__("" : "+r"(row_modn_p));
+#ifdef __ARM_NEON
+    static __thread compose_alpha_summaries row_summary;
+    if (N == 4u && summarize) {
+        compose_alpha_summaries *row_summary_p = &row_summary;
+        __asm__ __volatile__("" : "+r"(row_summary_p));
+        uintptr_t src = (uintptr_t)three, dst = (uintptr_t)row_modn_p;
+        uintptr_t summary = (uintptr_t)row_summary_p;
+        if ((src <= dst ? dst - src >= 0x4000u : src - dst >= 0x4000u)
+            && (src <= summary ? summary - src >= 0x4000u : src - summary >= sizeof(row_summary))) {
+            compose_permute_and_summarize_four(row_modn_p, three, row_summary_p);
+            *summaries = row_summary_p;
+            return row_modn_p;
+        }
+    }
+#endif
     const unsigned half = 128u * N;
     for (unsigned r = 0; r < N; r++) {
         const uint32_t *s = (const uint32_t *)(three + (size_t)r * N * 0x400);
@@ -1407,6 +1568,104 @@ void gpu2d_compose_render_line_prologue(void *ctx, uint32_t line, gpu_output_t *
     p->buf = buf;
 }
 
+
+#ifdef __ARM_NEON
+static __attribute__((always_inline)) inline void compose_store_capture_sixteen(uint8_t *planes, uint16_t *capture,
+        uint8x16_t red, uint8x16_t green, uint8x16_t blue)
+{
+    vst1q_u8(planes, red);
+    vst1q_u8(planes + 0x100u, green);
+    vst1q_u8(planes + 0x200u, blue);
+    uint8x16_t r = vshrq_n_u8(red, 1);
+    uint8x16_t g = vshrq_n_u8(green, 1);
+    uint8x16_t b = vorrq_u8(vandq_u8(vshlq_n_u8(blue, 1), vdupq_n_u8(0x7cu)),
+                            vdupq_n_u8(0x80u));
+    uint16x8_t lo = vaddw_u8(vshll_n_u8(vget_low_u8(g), 5), vget_low_u8(r));
+    uint16x8_t hi = vaddw_u8(vshll_n_u8(vget_high_u8(g), 5), vget_high_u8(r));
+    vst1q_u16(capture, vorrq_u16(lo, vshll_n_u8(vget_low_u8(b), 8)));
+    vst1q_u16(capture + 8, vorrq_u16(hi, vshll_n_u8(vget_high_u8(b), 8)));
+}
+
+static __attribute__((noinline)) int compose_capture_opaque_four(
+        const gpu2d_engine_t *e, uint8_t *dst, gpu_output_t *cap,
+        const recon_b2_prep *p, const uint8_t *three,
+        const compose_alpha_summaries *summaries, uint32_t *high)
+{
+    if (!three || !summaries || ((e->dispcnt >> 16) & 3u) != 2u || !cap
+        || cap->capture.source_a_mode != 1u || cap->capture.blend
+        || cap->capture.source_b_mode || cap->capture.width != 256u
+        || cap->capture.height <= p->line || p->line >= 192u
+        || (cap->capture.read_offset & ~UINT32_C(0xc000))
+        || cap->capture.display_mode >= 4u) return 0;
+    if (!recon_native_loaded || !recon_scale_3d_loaded || !recon_native
+        || recon_scale_out != 4u || (recon_scale_pages && recon_scale_pages < 4u)
+        || p->doubled != 1u) return 0;
+    if (!p->three || p->extra != 1u || p->lv21 || p->s576 || p->s752
+        || p->bright23 || (p->modes_f & 15u) || !(p->flags & 1u)
+        || (p->flags & ~31u) || (e->dispcnt & 0xe000u)) return 0;
+    if (e->draw_count == 0u || e->draw_count > 8u) return 0;
+    unsigned seen = 0u, before_bg0 = 1u, covered = 0u;
+#pragma clang loop unroll(disable)
+    for (unsigned i = 0; i < e->draw_count; ++i) {
+        unsigned layer = e->draw_order[i];
+        if (layer >= 8u || (seen & (1u << layer))) return 0;
+        seen |= 1u << layer;
+        if (layer == 0u) before_bg0 = 0u;
+        else if (before_bg0) {
+            const uint8_t *mask = p->buf + 0xda0u + layer * 32u;
+            covered |= vmaxvq_u8(vorrq_u8(vld1q_u8(mask), vld1q_u8(mask + 16u)));
+        }
+    }
+    if (!(seen & 1u) || covered || !cap->capture.source || !cap->capture.shadow)
+        return 0;
+    uint32_t off = (256u * p->line + cap->capture.read_offset) & 0xffffu;
+    uint8_t *native = cap->capture.source + (size_t)off * 2u;
+    uint8_t *shadow = cap->capture.shadow + (size_t)off * 32u;
+    if (compose_ranges_overlap(p->three, 0x4000u, p->buf, 0x1c00u)
+        || compose_ranges_overlap(dst, 0x3000u, native, 0x200u)
+        || compose_ranges_overlap(dst, 0x3000u, shadow, 0x2000u)) return 0;
+    const void *inputs[7] = {p->three, p->buf, e, cap, p, three, summaries};
+    const size_t sizes[7] = {0x4000u, 0x1c00u, sizeof(*e), sizeof(*cap), sizeof(*p),
+                             0x4000u, sizeof(*summaries)};
+    for (unsigned i = 0; i < 7u; ++i) {
+        if (compose_ranges_overlap(native, 0x200u, inputs[i], sizes[i])
+            || compose_ranges_overlap(shadow, 0x2000u, inputs[i], sizes[i])
+            || compose_ranges_overlap(dst, 0x3000u, inputs[i], sizes[i])) return 0;
+    }
+    uint32x4_t modes = vdupq_n_u32(0);
+    for (unsigned i = 0; i < 16u; i += 4u)
+        modes = vorrq_u32(modes, veorq_u32(vld1q_u32(summaries->mode + i),
+                                           vdupq_n_u32(16u)));
+    if (vmaxvq_u32(modes)) return 0;
+    uint8x16_t presence = vdupq_n_u8(0xffu);
+    for (unsigned i = 0; i < 16u; ++i)
+        presence = vandq_u8(presence, vandq_u8(vld1q_u8(summaries->mask[i]),
+                                              vld1q_u8(summaries->mask[i] + 16u)));
+    if (vminvq_u8(presence) != 0xffu) return 0;
+
+    for (unsigned s = 0; s < 16u; ++s) {
+        const uint8_t *src = three + s * 0x400u;
+        for (unsigned i = 0; i < 256u; i += 16u) {
+            uint8x16x4_t rgba = vld4q_u8(src + i * 4u);
+            compose_store_capture_sixteen(dst + s * 0x300u + i,
+                (uint16_t *)(shadow + s * 0x200u) + i,
+                rgba.val[0], rgba.val[1], rgba.val[2]);
+        }
+    }
+    uint32_t differ = 0u;
+#pragma clang loop unroll(disable)
+    for (unsigned s = 1; s < 16u; ++s) {
+        if (memcmp(dst + s * 0x300u, dst, 0x300u) != 0) {
+            differ = 1u;
+            break;
+        }
+    }
+    memmove(native, shadow, 0x200u);
+    *high = differ;
+    return 1;
+}
+#endif
+
 uint32_t gpu2d_compose_render_line_body(void *ctx, uint8_t *dst, gpu_output_t *cap, recon_b2_prep *p,
                             uint32_t *high)
 {
@@ -1417,7 +1676,12 @@ uint32_t gpu2d_compose_render_line_body(void *ctx, uint8_t *dst, gpu_output_t *c
     uint32_t flags = p->flags, extra = p->extra, modes_f = p->modes_f;
     const uint32_t m = p->m, bright23 = p->bright23, sext9 = p->sext9;
     uint8_t *lv21 = p->lv21, *s576 = p->s576, *s752 = p->s752;
-    uint8_t *three = permute_to_modn(p->three);
+    const compose_alpha_summaries *summaries;
+    uint8_t *three = permute_to_modn(p->three, doubled && extra && !bright23, &summaries);
+#ifdef __ARM_NEON
+    if (summaries && compose_capture_opaque_four(ctx, dst, cap, p, three, summaries, high))
+        return 1u;
+#endif
 
     table[0] = buf + 0x1e0;
     table[1] = buf + 0x400; table[2] = buf + 0x620;
@@ -1461,7 +1725,12 @@ uint32_t gpu2d_compose_render_line_body(void *ctx, uint8_t *dst, gpu_output_t *c
             if (three) {
                 uint8_t *p = three + (size_t)idx * 0x400;
                 if (bright23) { gpu2d_compose_scroll_line_h(buf, p, sext9); p = buf; }
-                w16 = (uint32_t)gpu2d_compose_fold_alpha_summary(buf + 0xda0, p) | modes_f;
+                if (summaries) {
+                    memcpy(buf + 0xda0, summaries->mask[idx], 32u);
+                    w16 = summaries->mode[idx] | modes_f;
+                } else {
+                    w16 = (uint32_t)gpu2d_compose_fold_alpha_summary(buf + 0xda0, p) | modes_f;
+                }
                 p3 = p;
             }
             w16 |= pack_all_three(c, buf, lv21, s576, s752, line, idx, table,
@@ -1991,35 +2260,46 @@ L_tail:
     }
 }
 
+#ifdef __ARM_NEON
+#define PAL 2
+#else
 #define PAL 4
+#endif
 #define OFF_COUNT 179
 #define OFF_LIST  0x84
 #define OFF_ACC   0x80
 #define OFF_BACKDROP  0xa0
 
+#ifdef __ARM_NEON
+typedef struct { uint64x2_t p[PAL]; } m256;
+#else
 typedef struct { uint64_t p[PAL]; } m256;
+#endif
 
 static m256 load(const uint8_t *d) {
     m256 v;
-    for (int i = 0; i < PAL; i++) __builtin_memcpy(&v.p[i], d + i * 8, 8);
+    for (int i = 0; i < PAL; i++) __builtin_memcpy(&v.p[i], d + i * sizeof(v.p[i]), sizeof(v.p[i]));
     return v;
 }
 
 static void store(uint8_t *d, m256 v) {
-    for (int i = 0; i < PAL; i++) __builtin_memcpy(d + i * 8, &v.p[i], 8);
+    for (int i = 0; i < PAL; i++) __builtin_memcpy(d + i * sizeof(v.p[i]), &v.p[i], sizeof(v.p[i]));
 }
 
+#ifdef __ARM_NEON
+__attribute__((noinline))
+#endif
 void gpu2d_compose_resolve_visibility_layered_pair(const uint8_t *obj, const uint8_t *masks,
                         uint8_t *above, uint8_t *below) {
 
     unsigned count = obj[OFF_COUNT];
     const uint8_t *list = obj + OFF_LIST;
 
-    m256 is_covered   = {{0, 0, 0, 0}};
-    m256 covered     = {{0, 0, 0, 0}};
-    m256 special = {{0, 0, 0, 0}};
-    m256 acc_above   = {{0, 0, 0, 0}};
-    m256 acc_below   = {{0, 0, 0, 0}};
+    m256 is_covered   = {{0}};
+    m256 covered     = {{0}};
+    m256 special = {{0}};
+    m256 acc_above   = {{0}};
+    m256 acc_below   = {{0}};
 
     for (unsigned n = 0; n < count; n++) {
         uint32_t shift = (uint32_t)list[n] << 5;
@@ -2068,37 +2348,44 @@ void gpu2d_compose_resolve_visibility_layered_pair(const uint8_t *obj, const uin
 #undef OFF_ACC
 #undef OFF_BACKDROP
 
+#ifdef __ARM_NEON
+#define PAL 2
+#else
 #define PAL 4
+#endif
 #define OFF_COUNT 179
 #define OFF_LIST  0x84
 #define OFF_SPECIALS 0x80
 #define OFF_BACKDROP      0xa0
 
+#ifdef __ARM_NEON
+typedef struct { uint64x2_t p[PAL]; } m256_24;
+#else
 typedef struct { uint64_t p[PAL]; } m256_24;
+#endif
 
 static m256_24 load_24(const uint8_t *d) {
     m256_24 v;
-    for (int i = 0; i < PAL; i++) {
-        uint64_t w;
-        __builtin_memcpy(&w, d + i * 8, 8);
-        v.p[i] = w;
-    }
+    for (int i = 0; i < PAL; i++) __builtin_memcpy(&v.p[i], d + i * sizeof(v.p[i]), sizeof(v.p[i]));
     return v;
 }
 
 static void store_24(uint8_t *d, m256_24 v) {
-    for (int i = 0; i < PAL; i++) __builtin_memcpy(d + i * 8, &v.p[i], 8);
+    for (int i = 0; i < PAL; i++) __builtin_memcpy(d + i * sizeof(v.p[i]), &v.p[i], sizeof(v.p[i]));
 }
 
+#ifdef __ARM_NEON
+__attribute__((noinline))
+#endif
 void gpu2d_compose_resolve_visibility(const uint8_t *obj, const uint8_t *masks,
                         uint8_t *output) {
 
     unsigned count = obj[OFF_COUNT];
     const uint8_t *list = obj + OFF_LIST;
 
-    m256_24 is_covered   = {{0, 0, 0, 0}};
-    m256_24 special = {{0, 0, 0, 0}};
-    m256_24 accumulated  = {{0, 0, 0, 0}};
+    m256_24 is_covered   = {{0}};
+    m256_24 special = {{0}};
+    m256_24 accumulated  = {{0}};
 
     for (unsigned n = 0; n < count; n++) {
         uint32_t shift = (uint32_t)list[n] << 5;
@@ -2205,6 +2492,22 @@ void gpu2d_planes_split_interleaved_masked(uint8_t *dest, uint8_t *quarter,
 #define BBB0_SEL(W) vtstq_u8(vqtbl1q_u8(vreinterpretq_u8_u16(vdupq_n_u16((uint16_t)(W))), vsel), vb8)
         for (int i = 0; i < WIDTH; i += 32) {
             uint32_t w = (uint32_t)mask[i >> 4] | ((uint32_t)mask[(i >> 4) + 1] << 16);
+            if (w == 0u) continue;
+            if (w == UINT32_MAX) {
+                uint8x16x4_t f0 = vld4q_u8(source + (unsigned)i * 4u);
+                uint8x16x4_t f1 = vld4q_u8(source + (unsigned)i * 4u + 64u);
+                vst1q_u8(p0 + i, f0.val[0]);
+                vst1q_u8(p0 + i + 16, f1.val[0]);
+                vst1q_u8(p1 + i, f0.val[1]);
+                vst1q_u8(p1 + i + 16, f1.val[1]);
+                vst1q_u8(p2 + i, f0.val[2]);
+                vst1q_u8(p2 + i + 16, f1.val[2]);
+                if (quarter) {
+                    vst1q_u8(quarter + i, f0.val[3]);
+                    vst1q_u8(quarter + i + 16, f1.val[3]);
+                }
+                continue;
+            }
             uint8x16_t s0 = BBB0_SEL(w), s1 = BBB0_SEL(w >> 16);
             uint8x16x4_t f0 = vld4q_u8(source + (unsigned)i * 4u);
             uint8x16x4_t f1 = vld4q_u8(source + (unsigned)i * 4u + 64u);
@@ -2244,6 +2547,7 @@ void gpu2d_planes_split_interleaved_masked(uint8_t *dest, uint8_t *quarter,
 #define WIDTH 256
 #define PLANE 0x100
 
+__attribute__((noinline))
 void gpu2d_compose_split_rgb_planes(uint8_t *dest, const uint16_t *origin) {
 
     uint8_t *r = dest;
@@ -2251,6 +2555,16 @@ void gpu2d_compose_split_rgb_planes(uint8_t *dest, const uint16_t *origin) {
     uint8_t *b = dest + 2 * PLANE;
 
 #ifdef __ARM_NEON
+
+    uintptr_t output = (uintptr_t)dest, input = (uintptr_t)origin;
+    if (output >= input ? output - input >= 0x200u : input - output >= 0x300u) {
+        for (int i = 0; i < WIDTH; i += 16) {
+            uint16x8_t low = vld1q_u16(origin + i);
+            uint16x8_t high = vld1q_u16(origin + i + 8);
+            store_rgb_planes16(dest + i, low, high);
+        }
+        return;
+    }
 
     const uint16x8_t m3e = vdupq_n_u16(0x3eu);
     for (int i = 0; i < WIDTH; i += 8) {
@@ -2309,18 +2623,18 @@ void gpu2d_compose_pack_planes_to_rgb15(const gpu_output_t *ctx, uint8_t *dst, c
         for (unsigned m = 0; m < 32u; m += 16u) {
             uint8x16_t r = vshrq_n_u8(vld1q_u8(R + m), 1);
             uint8x16_t g = vshrq_n_u8(vld1q_u8(G + m), 1);
-            uint8x16_t b = vshrq_n_u8(vld1q_u8(B + m), 1);
+            uint8x16_t b = vshlq_n_u8(vld1q_u8(B + m), 1);
+            b = vorrq_u8(vandq_u8(b, vdupq_n_u8(0x7cu)), vdupq_n_u8(0x80u));
 
             uint16x8_t lo = vaddw_u8(vshll_n_u8(vget_low_u8(g), 5), vget_low_u8(r));
             uint16x8_t hi = vaddw_u8(vshll_n_u8(vget_high_u8(g), 5), vget_high_u8(r));
-            uint16x8_t bl = vshlq_n_u16(vmovl_u8(vget_low_u8(b)), 10);
-            uint16x8_t bh = vshlq_n_u16(vmovl_u8(vget_high_u8(b)), 10);
-            const uint16x8_t opaque = vdupq_n_u16(0x8000u);
+            uint16x8_t bl = vshll_n_u8(vget_low_u8(b), 8);
+            uint16x8_t bh = vshll_n_u8(vget_high_u8(b), 8);
 
             vst1q_u16((uint16_t *)(D + (size_t)m * 2),
-                      vorrq_u16(vorrq_u16(lo, opaque), bl));
+                      vorrq_u16(lo, bl));
             vst1q_u16((uint16_t *)(D + (size_t)m * 2 + 16),
-                      vorrq_u16(vorrq_u16(hi, opaque), bh));
+                      vorrq_u16(hi, bh));
         }
         off += 32;
         cnt -= 32;
@@ -2561,6 +2875,48 @@ void gpu2d_compose_extract_alpha_plane_c110(const unsigned char *pl, unsigned ch
 
 void gpu2d_compose_extract_alpha_plane_c200(const unsigned char *a, const unsigned char *b,
                              unsigned char *dst, uint32_t mult, uint32_t sum) {
+#ifdef __ARM_NEON
+    uint8x8_t factor = vdup_n_u8((uint8_t)mult);
+    uint16x8_t bias = vdupq_n_u16((uint16_t)sum);
+    for (unsigned g = 0; g < 16; g++) {
+        uint8x16_t a0 = vshlq_n_u8(vld1q_u8(a), 2);
+        uint8x16_t a1 = vshlq_n_u8(vld1q_u8(a + PLANE_B), 2);
+        uint8x16_t a2 = vshlq_n_u8(vld1q_u8(a + 2u * PLANE_B), 2);
+        uint8x16_t b0 = vshlq_n_u8(vld1q_u8(b), 2);
+        uint8x16_t b1 = vshlq_n_u8(vld1q_u8(b + PLANE_B), 2);
+        uint8x16_t b2 = vshlq_n_u8(vld1q_u8(b + 2u * PLANE_B), 2);
+        uint16x8_t a0lo = vmlal_u8(bias, vget_low_u8(a0), factor);
+        uint16x8_t a0hi = vmlal_u8(bias, vget_high_u8(a0), factor);
+        uint16x8_t a1lo = vmlal_u8(bias, vget_low_u8(a1), factor);
+        uint16x8_t a1hi = vmlal_u8(bias, vget_high_u8(a1), factor);
+        uint16x8_t a2lo = vmlal_u8(bias, vget_low_u8(a2), factor);
+        uint16x8_t a2hi = vmlal_u8(bias, vget_high_u8(a2), factor);
+        uint16x8_t b0lo = vmlal_u8(bias, vget_low_u8(b0), factor);
+        uint16x8_t b0hi = vmlal_u8(bias, vget_high_u8(b0), factor);
+        uint16x8_t b1lo = vmlal_u8(bias, vget_low_u8(b1), factor);
+        uint16x8_t b1hi = vmlal_u8(bias, vget_high_u8(b1), factor);
+        uint16x8_t b2lo = vmlal_u8(bias, vget_low_u8(b2), factor);
+        uint16x8_t b2hi = vmlal_u8(bias, vget_high_u8(b2), factor);
+        a0 = vcombine_u8(vshrn_n_u16(a0lo, 5), vshrn_n_u16(a0hi, 5));
+        a1 = vcombine_u8(vshrn_n_u16(a1lo, 5), vshrn_n_u16(a1hi, 5));
+        a2 = vcombine_u8(vshrn_n_u16(a2lo, 5), vshrn_n_u16(a2hi, 5));
+        b0 = vcombine_u8(vshrn_n_u16(b0lo, 5), vshrn_n_u16(b0hi, 5));
+        b1 = vcombine_u8(vshrn_n_u16(b1lo, 5), vshrn_n_u16(b1hi, 5));
+        b2 = vcombine_u8(vshrn_n_u16(b2lo, 5), vshrn_n_u16(b2hi, 5));
+        uint8x16x4_t lo, hi;
+        lo.val[0] = vzip1q_u8(a0, b0); hi.val[0] = vzip2q_u8(a0, b0);
+        lo.val[1] = vzip1q_u8(a1, b1); hi.val[1] = vzip2q_u8(a1, b1);
+        lo.val[2] = vzip1q_u8(a2, b2); hi.val[2] = vzip2q_u8(a2, b2);
+        lo.val[3] = vreinterpretq_u8_u16(a0hi);
+        hi.val[3] = vreinterpretq_u8_u16(b1lo);
+        vst4q_u8(dst, lo);
+        vst4q_u8(dst + 64, hi);
+        a += 16;
+        b += 16;
+        dst += 128;
+    }
+#else
+
     uint32_t m = (uint8_t)mult;
     uint32_t s = (uint16_t)sum;
     for (unsigned g = 0; g < 16; g++) {
@@ -2599,6 +2955,7 @@ void gpu2d_compose_extract_alpha_plane_c200(const unsigned char *a, const unsign
         b += 16;
         dst += 128;
     }
+#endif
 }
 #undef PLANE_B
 

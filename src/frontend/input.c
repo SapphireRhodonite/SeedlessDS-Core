@@ -5,11 +5,40 @@
 #include "frontend/script/script_io.h"
 #include <string.h>
 #include <time.h>
+#if defined(__linux__)
+#include <errno.h>
+#include <unistd.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#endif
 #include "frontend/frontend.h"
 #include "seedlessds/platform.h"
 #include "core_internals.h"
 #include "mem_access.h"
 #include "seedlessds/control.h"
+
+static uint32_t pause_generation;
+
+void input_pause_notify(void)
+{
+    __atomic_add_fetch(&pause_generation, 1u, __ATOMIC_RELEASE);
+#if defined(__linux__)
+    syscall(SYS_futex, &pause_generation, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+#endif
+}
+
+static void input_pause_wait(uint32_t generation)
+{
+#if defined(__linux__)
+    const struct timespec timeout = {0, 50000000};
+    if (syscall(SYS_futex, &pause_generation, FUTEX_WAIT_PRIVATE, generation, &timeout, NULL, 0) != 0
+        && errno != EAGAIN && errno != EINTR && errno != ETIMEDOUT)
+        nds_platform_default()->threads.sleep_us(50000);
+#else
+    (void)generation;
+    nds_platform_default()->threads.sleep_us(50000);
+#endif
+}
 
 uint64_t input_hook_noop(uint64_t x0)
 {
@@ -109,8 +138,9 @@ void input_poll_and_pause(uint8_t *ctx) {
     nds_control_frame_boundary();
     nds_control_poll_state(g->machine);
     uint32_t request = (g->state_saving != 0);
+    uint32_t generation = __atomic_load_n(&pause_generation, __ATOMIC_ACQUIRE);
 
-    if ((g->pause_request != 0 || nds_control_pause_requested()) && g->quit_request == 0) {
+    if ((__atomic_load_n(&g->pause_request, __ATOMIC_ACQUIRE) != 0 || nds_control_pause_requested()) && __atomic_load_n(&g->quit_request, __ATOMIC_ACQUIRE) == 0) {
         do {
             nds_control_pause_acknowledge(1);
             nds_control_poll_state(g->machine);
@@ -126,13 +156,14 @@ void input_poll_and_pause(uint8_t *ctx) {
                 cheats_load_entry_by_key(&c->cart.cheats, rd32(q), rd32(q + 4));
                 g->cheats_update_request = 0;
             }
-            nds_platform_default()->threads.sleep_us(50000);
+            input_pause_wait(generation);
 
             pacer_init((unsigned char *)g->machine);
 
             platform_doublebuffer_signal();
             request = (g->state_saving != 0);
-        } while ((g->pause_request != 0 || nds_control_pause_requested()) && g->quit_request == 0);
+            generation = __atomic_load_n(&pause_generation, __ATOMIC_ACQUIRE);
+        } while ((__atomic_load_n(&g->pause_request, __ATOMIC_ACQUIRE) != 0 || nds_control_pause_requested()) && __atomic_load_n(&g->quit_request, __ATOMIC_ACQUIRE) == 0);
         nds_control_pause_acknowledge(0);
     }
 
@@ -151,7 +182,7 @@ void input_poll_and_pause(uint8_t *ctx) {
         }
     }
 
-    if (g->quit_request != 0) { wr32(dst, 0x4000000u); return; }
+    if (__atomic_load_n(&g->quit_request, __ATOMIC_ACQUIRE) != 0) { wr32(dst, 0x4000000u); return; }
 
     if (g->rom_load_request != 0) {
         nds_t *c = g->machine;
@@ -162,7 +193,7 @@ void input_poll_and_pause(uint8_t *ctx) {
 
         if (cart_open_rom(&c->cart, g->rom_path) == 0)
             load(g, 1);
-        g->quit_request = 1;
+        __atomic_store_n(&g->quit_request, 1, __ATOMIC_RELEASE);
         return;
     }
 

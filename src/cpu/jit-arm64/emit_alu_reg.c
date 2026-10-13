@@ -889,7 +889,48 @@ unsigned char *jit_emit_arm_data_processing_reg(jit_emitter_t *machine, uint32_t
         }
         {
             uint32_t vari = (w20 >> 21) & 3u;
-            if (vari == 1u || vari == 2u) {
+            if (vari == 1u) {
+                uint32_t rm = w20 & 0xfu;
+                uint32_t rs = (w20 >> 8) & 0xfu;
+                uint32_t rd = (w20 >> 16) & 0xfu;
+                uint32_t rmHost = rm == 15u ? 0u : rm + 13u;
+                uint32_t rsHost = rs == 15u ? 1u : rs + 13u;
+                uint32_t rdHost = rd == 15u ? 0u : rd + 13u;
+
+                if (rm == 15u)
+                    jit_emit_mov_imm32(machine, 0u, machine->record->pc_value);
+                if (rs == 15u)
+                    jit_emit_mov_imm32(machine, 1u, machine->record->pc_value);
+
+                unsigned char *cursor = machine->code;
+                uint32_t extract = (w20 & 0x40u) != 0u
+                    ? UINT32_C(0x13107c00) : UINT32_C(0x13003c00);
+                wr32(cursor, extract | (rsHost << 5));
+                machine->code = cursor + 4;
+
+                if ((w20 & 0x20u) != 0u) {
+                    wr32(cursor + 4, UINT32_C(0x9b207c00) | (rmHost << 5) | rdHost);
+                    wr32(cursor + 8, UINT32_C(0x9350bc00) | (rdHost << 5) | rdHost);
+                    machine->code = cursor + 12;
+                } else {
+                    uint32_t rn = (w20 >> 12) & 0xfu;
+                    uint32_t rnHost = rn == 15u ? 2u : rn + 13u;
+                    if (rn == 15u)
+                        jit_emit_mov_imm32(machine, 2u, machine->record->pc_value);
+                    cursor = machine->code;
+                    wr32(cursor, UINT32_C(0x9b207c03) | (rmHost << 5));
+                    wr32(cursor + 4, UINT32_C(0x9350bc63));
+                    wr32(cursor + 8, UINT32_C(0x8b20c060) | (rnHost << 16) | rdHost);
+                    wr32(cursor + 12, UINT32_C(0xcb20c000) | (rdHost << 5) | (rdHost << 16));
+                    wr32(cursor + 16, UINT32_C(0xb4000080));
+                    wr32(cursor + 20, UINT32_C(0xb963c381));
+                    wr32(cursor + 24, UINT32_C(0x32250021));
+                    wr32(cursor + 28, UINT32_C(0xb923c381));
+                    machine->code = cursor + 32;
+                }
+                return x22;
+            }
+            if (vari == 2u) {
 
                 return x22;
             }

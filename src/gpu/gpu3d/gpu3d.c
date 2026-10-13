@@ -190,21 +190,21 @@ void gpu3d_init_color_product_tables(gpu3d_t *ctx)
 unsigned recon_threads_created = 4u;
 static unsigned band_ticket;
 
-static unsigned char band_state[32];
+static unsigned char band_state[RECON_BAND_CAPACITY];
 __thread unsigned recon_band_current = 0xffffu;
 
 void recon_band_reset(void) { __atomic_store_n(&band_ticket, 0u, __ATOMIC_RELEASE); memset(band_state, 0, sizeof band_state); }
 
 void recon_band_publish(unsigned band, unsigned dirty)
-{ if (band < 32u) __atomic_fetch_or(&band_state[band], (unsigned char)(1u | (dirty ? 2u : 0u)), __ATOMIC_RELEASE); }
+{ if (band < RECON_BAND_CAPACITY) __atomic_fetch_or(&band_state[band], (unsigned char)(1u | (dirty ? 2u : 0u)), __ATOMIC_RELEASE); }
 
 void recon_band_publish_dirty(void)
-{ unsigned b = recon_band_current; if (b < 32u && !(__atomic_load_n(&band_state[b], __ATOMIC_RELAXED) & 2u)) __atomic_fetch_or(&band_state[b], (unsigned char)2u, __ATOMIC_RELEASE); }
+{ unsigned b = recon_band_current; if (b < RECON_BAND_CAPACITY && !(__atomic_load_n(&band_state[b], __ATOMIC_RELAXED) & 2u)) __atomic_fetch_or(&band_state[b], (unsigned char)2u, __ATOMIC_RELEASE); }
 
 unsigned recon_band_sibling_dirty(unsigned band)
 {
     unsigned h = band ^ 1u;
-    if (h >= 32u) return 0u;
+    if (h >= RECON_BAND_CAPACITY) return 0u;
     unsigned char e;
     unsigned long turns = 0;
     while (!((e = __atomic_load_n(&band_state[h], __ATOMIC_ACQUIRE)) & 3u)) {
@@ -246,7 +246,7 @@ unsigned recon_band_rows = 32u;
 gpu3d_band_bucket_t *recon_buckets(unsigned char *arena, unsigned side)
 {
     if (recon_bands_3d == 12u) return ((gpu_t *)arena)->bucket[side ? 1 : 0];
-    static gpu3d_band_bucket_t buckets[2][32] __attribute__((aligned(64)));
+    static gpu3d_band_bucket_t buckets[2][RECON_BAND_CAPACITY] __attribute__((aligned(64)));
     return buckets[side ? 1 : 0];
 }
 unsigned recon_native;

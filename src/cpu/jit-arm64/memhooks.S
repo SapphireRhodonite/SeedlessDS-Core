@@ -3026,30 +3026,15 @@ jit_cpsr_write_mode:
     stp  w16, w17, [x9, #-208]
     str  w18, [x28, #8968]
     str  x30, [x28, #9064]
-    mrs  x2, nzcv
     str  w2, [x28, #9044]
     bl   arm_bank_switch
     add  x9, x28, #0x3d0
     add  x9, x9, #0x2, lsl #12
-    ldp  x10, x11, [x9, #-120]
-    ldp  w12, w13, [x9, #-224]
-    ldp  w14, w15, [x9, #-216]
-    ldp  w16, w17, [x9, #-208]
-    ldr  w18, [x28, #8968]
-    ldr  x30, [x28, #9064]
-    ldr  w0, [x28, #9044]
-    msr  nzcv, x0
-    ldr  w0, [x28, #9144]
-    ldp  w13, w14, [x9, #-96]
-    ldp  w15, w16, [x9, #-88]
-    ldp  w17, w18, [x9, #-80]
     ldp  w19, w20, [x9, #-72]
     ldp  w21, w22, [x9, #-64]
     ldp  w23, w24, [x9, #-56]
     ldp  w25, w26, [x9, #-48]
     ldur w27, [x9, #-40]
-    msr  nzcv, x0
-    b    L_jit_cpsr_write_mode_exit_1
 L_jit_cpsr_write_mode_exit_1:
     adrp x0, :got:jit_mem_write_irq_check
     ldr  x0, [x0, :got_lo12:jit_mem_write_irq_check]

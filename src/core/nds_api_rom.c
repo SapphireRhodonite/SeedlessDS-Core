@@ -78,8 +78,8 @@ static void frontend_prepare(frontend_t *g, const nds_rom_open_t *open)
     g->frame_counter = 0;
     g->config_bits = open->config_bits;
     g->lid_closed = 0;
-    g->quit_request = 0;
-    g->pause_request = 0;
+    __atomic_store_n(&g->quit_request, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g->pause_request, 0, __ATOMIC_RELEASE);
     g->buttons = 0;
     g->state_slot = 0;
     g->state_saving = 0;
@@ -191,7 +191,7 @@ int nds_insert_gba(nds_t *nds, const char *path, int state_slot, int in_cache_di
     g->frame_state = FRAME_STATE_LOADING;
     g->run_limit_us = run_limit_us;
     g->lid_closed = 0;
-    g->quit_request = 0;
+    __atomic_store_n(&g->quit_request, 0, __ATOMIC_RELEASE);
     g->buttons = 0;
     g->state_slot = 0;
     g->state_saving = 0;

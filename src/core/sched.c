@@ -157,6 +157,7 @@ void sched_scanline_event(void *machine, void *argument) {
 
     if (code > 0x104) {
         if (code == 0x106) {
+            gpu3d_raster_frame_finish_pending();
             for (int k = 0; k < 4; k++)
                 if (((int32_t)bus->dma[0].channels[k].cnt < 0)
                     && bus->dma[0].channels[k].start_mode == 3)
@@ -219,8 +220,7 @@ void sched_scanline_event(void *machine, void *argument) {
         uint32_t arg = ((m & 8) == 0) ? n : 1u;
         void *dst = &((nds_t *)machine)->gpu;
         if (((nds_t *)machine)->config.threaded_3d == 0) {
-            gpu3d_raster_frame_dispatch_select(dst, arg);
-            recon_scale_commit_output(recon_scale_render_tag);
+            gpu3d_raster_frame_begin(dst, arg);
         } else
             gpu3d_raster_frame_thread_submit(dst, arg);
         sig = 0xd7;

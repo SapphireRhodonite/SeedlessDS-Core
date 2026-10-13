@@ -252,13 +252,99 @@ static void recon_reduce_hires(unsigned char *machine, gpu3d_raster_t *state)
 
 }
 
-void gpu3d_raster_frame_dispatch_hires(gpu_t *gpu, uint32_t mode) {
+enum { GPU3D_BAND_COMPOSE_WORK = 2, GPU3D_BAND_HIRES_WORK = 3 };
+
+static void compose_bands_parallel(unsigned char *base, unsigned threads)
+{
+    const nds_platform_threads_t *platform = &nds_platform_default()->threads;
+    if (threads > 4u) threads = 4u;
+    GPU3D_BAND_HEADER(base)->threads = (uint8_t)threads;
+    for (unsigned i = 1; i < threads; ++i) {
+        gpu3d_band_header_t *hdr = GPU3D_BAND_HEADER(base + i * recon_block_stride);
+        platform->mutex_lock(hdr->mutex);
+        hdr->threads = (uint8_t)threads;
+        hdr->start = GPU3D_BAND_COMPOSE_WORK;
+        platform->cond_signal(hdr->cond);
+        platform->mutex_unlock(hdr->mutex);
+    }
+    gpu3d_raster_band_compose_worker(base);
+    for (unsigned i = 1; i < threads; ++i) {
+        gpu3d_band_header_t *hdr = GPU3D_BAND_HEADER(base + i * recon_block_stride);
+        platform->mutex_lock(hdr->mutex_done);
+        while (hdr->done == 0)
+            platform->cond_wait(hdr->cond_done, hdr->mutex_done);
+        hdr->done = 0;
+        platform->mutex_unlock(hdr->mutex_done);
+    }
+}
+
+static gpu_t *pending_raster_gpu;
+static unsigned pending_raster_threads;
+static unsigned pending_raster_scale;
+static int pending_raster_edge_enabled;
+
+static void finish_hires_raster(gpu_t *gpu, unsigned threads, int edge_enabled)
+{
+    const nds_platform_threads_t *platform = &nds_platform_default()->threads;
+    int (*mtx_lock)(void *) = platform->mutex_lock;
+    int (*mtx_unlock)(void *) = platform->mutex_unlock;
+    int (*cnd_wait)(void *, void *) = platform->cond_wait;
+    unsigned char *machine = (unsigned char *)gpu;
+    gpu3d_raster_t *state = &gpu->raster;
+    unsigned char *C0 = recon_ctx3d_base(machine);
+    const unsigned long BLK = recon_block_stride;
+    gpu3d_raster_band_pending_process(C0);
+    if (threads >= 2) {
+        for (uint64_t i = 1; i != threads; i++) {
+            gpu3d_band_header_t *p = GPU3D_BAND_HEADER(C0 + i * BLK);
+            mtx_lock(p->mutex_done);
+            if (p->done == 0) {
+                do { cnd_wait(p->cond_done, p->mutex_done); } while (p->done == 0);
+            }
+            p->done = 0;
+            mtx_unlock(p->mutex_done);
+        }
+    }
+    int boundaries_composed = gpu3d_raster_band_compose_end(gpu);
+    if (boundaries_composed) {
+        unsigned count = threads > 4u ? 4u : threads;
+        for (unsigned i = 0; i < count; ++i)
+            GPU3D_BAND_HEADER(C0 + i * BLK)->threads = (uint8_t)count;
+    }
+    uint32_t end = state->disp3dcnt;
+    if ((end & 0x20) && (edge_enabled < 0 ? *(uint32_t *)((unsigned char *)gpu->vram.config + 1180) == 0 : edge_enabled)) {
+        uint32_t k = (end >> 6) & 3;
+
+        if (k < 2)       gpu3d_raster_band_flush_scaled(gpu);
+        else if (k == 2) {
+            if (!boundaries_composed) {
+                if (threads > 1u && recon_scale_3d > 2u && state->frame_front
+                    && recon_tables_base(machine) != gpu->frame[0])
+                    compose_bands_parallel(C0, threads);
+                else
+                    gpu3d_raster_band_compose_block_pairs(gpu);
+            }
+        }
+        else             gpu3d_raster_band_pair_compose(gpu);
+
+        recon_pass++;
+
+        recon_native_read();
+        if (recon_scale_3d > 2u && !recon_native) recon_reduce_hires(machine, state);
+        return;
+    }
+
+    recon_native_read();
+    if (recon_scale_3d > 2u && !recon_native) recon_reduce_hires(machine, state);
+    return;
+}
+
+static int dispatch_hires_raster(gpu_t *gpu, uint32_t mode, int defer) {
     nds_trace_3d_dispatch();
 
     int (*mtx_lock)(void *)   = nds_platform_default()->threads.mutex_lock;
     int (*mtx_unlock)(void *) = nds_platform_default()->threads.mutex_unlock;
     int (*cnd_signal)(void *) = nds_platform_default()->threads.cond_signal;
-    int (*cnd_wait)(void *, void *) = nds_platform_default()->threads.cond_wait;
 
     unsigned char *machine = (unsigned char *)gpu;
     gpu3d_t *g3 = GPU3D_OF(gpu);
@@ -334,8 +420,13 @@ void gpu3d_raster_frame_dispatch_hires(gpu_t *gpu, uint32_t mode) {
         boss_hdr->pass = (uint8_t)batch;
         uint32_t threads = recon_threads_3d(*(uint32_t *)(g + 1168));
 
-        unsigned char *boss = C0;
-
+        int deferred = defer && threads > 1u && recon_scale_3d > 2u
+            && (state->disp3dcnt & 0x4000u) == 0u;
+        gpu3d_raster_band_compose_begin(gpu, deferred && RECON_BANDS != 24u
+            && RECON_BANDS > 1u && RECON_BANDS <= RECON_BAND_CAPACITY
+            && (sel & 0xe0u) == 0xa0u && batch == 0u && state->frame_front
+            && recon_tables_base(machine) != gpu->frame[0]);
+        boss_hdr->threads = (uint8_t)threads;
         recon_band_reset();
         if (threads > 1) {
             gpu3d_band_header_t *w = GPU3D_BAND_HEADER(C0 + BLK);
@@ -344,7 +435,7 @@ void gpu3d_raster_frame_dispatch_hires(gpu_t *gpu, uint32_t mode) {
                 w->pass = (uint8_t)batch;
                 w->threads = (uint8_t)threads;
                 mtx_lock(w->mutex);
-                w->start = 1;
+                w->start = deferred ? GPU3D_BAND_HIRES_WORK : 1u;
                 cnd_signal(w->cond);
                 mtx_unlock(w->mutex);
                 if (left == 0) break;
@@ -353,52 +444,53 @@ void gpu3d_raster_frame_dispatch_hires(gpu_t *gpu, uint32_t mode) {
                 left--;
                 batch = *(uint32_t *)(g + 1180);
             }
-            boss_hdr->threads = (uint8_t)threads;
-            gpu3d_raster_band_pending_process(boss);
-
-            if (threads >= 2) {
-                for (uint64_t i = 1; i != threads; i++) {
-                    gpu3d_band_header_t *p = GPU3D_BAND_HEADER(C0 + i * BLK);
-                    mtx_lock(p->mutex_done);
-                    if (p->done == 0) {
-                        do { cnd_wait(p->cond_done, p->mutex_done); } while (p->done == 0);
-                    }
-                    p->done = 0;
-                    mtx_unlock(p->mutex_done);
-                }
-            }
-        } else {
-            boss_hdr->threads = (uint8_t)threads;
-            gpu3d_raster_band_pending_process(boss);
         }
-
-        uint32_t end = state->disp3dcnt;
-        if ((end & 0x20) && *(uint32_t *)((unsigned char *)gpu->vram.config + 1180) == 0) {
-            uint32_t k = (end >> 6) & 3;
-
-            if (k < 2)       gpu3d_raster_band_flush_scaled(gpu);
-            else if (k == 2) gpu3d_raster_band_compose_block_pairs(gpu);
-            else             gpu3d_raster_band_pair_compose(gpu);
-
-            recon_pass++;
-
-            recon_native_read();
-            if (recon_scale_3d > 2u && !recon_native) recon_reduce_hires(machine, state);
-            return;
+        if (deferred) {
+            pending_raster_gpu = gpu;
+            pending_raster_threads = threads;
+            pending_raster_scale = recon_scale_render_tag;
+            pending_raster_edge_enabled = batch == 0u;
+            return 1;
         }
-
-        recon_native_read();
-        if (recon_scale_3d > 2u && !recon_native) recon_reduce_hires(machine, state);
-        return;
+        finish_hires_raster(gpu, threads, -1);
+        return 0;
     }
 
-    if (*(uint32_t *)(g + 1128) == 0) return;
+    if (*(uint32_t *)(g + 1128) == 0) return 0;
     void *prev = state->frame_last;
-    if ((void *)dest == prev) return;
+    if ((void *)dest == prev) return 0;
     ((void *(*)(void *, const void *, unsigned long))sym_libc_memcpy)(
                dest, prev, recon_buf3d_bytes());
 
+    return 0;
 }
+
+void gpu3d_raster_frame_dispatch_hires(gpu_t *gpu, uint32_t mode)
+{
+    (void)dispatch_hires_raster(gpu, mode, 0);
+}
+
+void gpu3d_raster_frame_finish_pending(void)
+{
+    gpu_t *gpu = pending_raster_gpu;
+    if (!gpu) return;
+    finish_hires_raster(gpu, pending_raster_threads, pending_raster_edge_enabled);
+    recon_scale_commit_output(pending_raster_scale);
+    pending_raster_gpu = 0;
+}
+
+void gpu3d_raster_frame_begin(gpu_t *gpu, uint32_t mode)
+{
+    gpu3d_raster_frame_finish_pending();
+    uint32_t hires = *(uint32_t *)((unsigned char *)gpu->vram.config + 1184);
+    if (hires) {
+        if (dispatch_hires_raster(gpu, mode, 1)) return;
+    } else {
+        gpu3d_raster_frame_dispatch(gpu, mode);
+    }
+    recon_scale_commit_output(recon_scale_render_tag);
+}
+
 
 unsigned char *gpu3d_raster_scanline_lookup(const gpu_t *ctx, uint32_t idx) {
     const unsigned char *sub = (const unsigned char *)ctx->vram.config;
@@ -563,10 +655,13 @@ void gpu3d_raster_band_thread_run(void *ctx)
         while (s->start == 0)
             wait(cA, mA);
 
+        unsigned work_kind = s->start;
         s->start = 0;
         unlock(mA);
 
-        if (rd32(count + 1184) == 0) gpu3d_raster_band_draw_dispatch((unsigned char *)ctx);
+        if (work_kind == GPU3D_BAND_COMPOSE_WORK) gpu3d_raster_band_compose_worker(ctx);
+        else if (work_kind == GPU3D_BAND_HIRES_WORK) gpu3d_raster_band_pending_process(ctx);
+        else if (rd32(count + 1184) == 0) gpu3d_raster_band_draw_dispatch((unsigned char *)ctx);
         else                         gpu3d_raster_band_pending_process(ctx);
 
         lock(mB);

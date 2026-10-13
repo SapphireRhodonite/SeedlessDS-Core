@@ -339,8 +339,17 @@ static void scan_irq(uint8_t *g, io_mirror_t *mir9)
     if (p) ((arm_t *)o)->wake_flags = (((arm_t *)o)->wake_flags | 2);
 }
 
+static inline void finish_raster_before_write(uint32_t reg, unsigned width)
+{
+    if ((reg < 0x62u && reg + width > 0x60u)
+        || (reg < 0x400u && reg + width > 0x320u)
+        || (reg < 0x24au && reg + width > 0x240u))
+        gpu3d_raster_frame_finish_pending();
+}
+
 void io9_write8(void *ctx, uint32_t reg, uint32_t val)
 {
+    finish_raster_before_write(reg, 1u);
     uint8_t *c  = (uint8_t *)ctx;
     uint8_t *g  = c;
     uint8_t *r  = c + R;
@@ -564,6 +573,10 @@ void io9_write8(void *ctx, uint32_t reg, uint32_t val)
         return;
     }
 
+    case 0x1a0:
+        val &= 0x7fu;
+        goto mirror;
+
     case 0x1a2: {
         uint32_t ctl = rd16(r + 412);
         uint8_t *b0 = rd_ptr_u8(bd);
@@ -667,6 +680,7 @@ static void dma_engine_4(uint8_t *g, uint32_t engine_idx, uint32_t reg, uint32_t
 
 void io9_write16(void *ctx, uint32_t reg, uint32_t val)
 {
+    finish_raster_before_write(reg, 2u);
     uint8_t *c  = (uint8_t *)ctx;
     uint8_t *g  = c;
     bus_t *bus = (bus_t *)ctx;
@@ -887,6 +901,7 @@ static void shared_ipc_tail(dma_t *a, dma_channel_t *b)
 
 void io9_write32(void *param_1, uint32_t param_2, uint64_t param_3)
 {
+    finish_raster_before_write(param_2, 4u);
 
     uint32_t w20 = (uint32_t)param_3;
 

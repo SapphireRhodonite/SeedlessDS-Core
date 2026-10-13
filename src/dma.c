@@ -76,6 +76,33 @@ typedef unsigned char *(*fn_ptr)(void *arena, uint32_t dir);
 typedef const uint32_t *(*fn_map)(void *arena, unsigned char *entry,
                                    uint32_t dir);
 
+#if defined(__clang__)
+static __attribute__((noinline)) void dma_copy_memory_units(unsigned char *dst,
+        const unsigned char *src, uint32_t count, uint32_t width,
+        int step_src, int step_dst)
+{
+    int src_stride = step_src * (int)width;
+    int dst_stride = step_dst * (int)width;
+    if (width == 2) {
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+        do {
+            uint16_t value = rd16(src);
+            src += src_stride;
+            wr16(dst, value);
+            dst += dst_stride;
+        } while (--count);
+    } else {
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+        do {
+            uint32_t value = rd32(src);
+            src += src_stride;
+            wr32(dst, value);
+            dst += dst_stride;
+        } while (--count);
+    }
+}
+#endif
+
 uint64_t dma_channel_run_transfer(dma_t *machine, dma_channel_t *channel)
 {
 
@@ -222,6 +249,11 @@ uint64_t dma_channel_run_transfer(dma_t *machine, dma_channel_t *channel)
             if (coarse != 0)
                 result |= mirror_dirty_bitmap_test(coarse, fine, dst, bytes);
 
+#if defined(__clang__)
+            if (flags == 0) {
+                dma_copy_memory_units(pd, po, run, width, step_o, step_d);
+            } else
+#endif
             {
                 uint32_t i = run;
                 uint32_t dir_o = org, dir_d = dst;

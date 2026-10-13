@@ -1,3 +1,13 @@
+#include <archive.h>
+#include <archive_entry.h>
+#include <unarr.h>
+#include <fcntl.h>
+#include <locale.h>
+#include <stdlib.h>
+#include <unistd.h>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include <stdint.h>
 #include "hires_runtime.h"
 #include "blob_symbols.h"
@@ -612,7 +622,7 @@ void *archive_7z_extract_by_extension(const char *path, const char *suffix, uint
     uint64_t capacity = 0;
     uint64_t idx = 0;
     uint64_t offset = 0;
-    uint32_t accumulated = 0;
+    uint64_t accumulated = 0;
     uint32_t state_final = 0;
     uint64_t reference = 0;
     uint8_t *entries;
@@ -734,7 +744,7 @@ void *archive_7z_extract_by_extension(const char *path, const char *suffix, uint
         break;
 
 no_matches:
-        accumulated += rd32(reg + 8);
+        Buf_Free(name_buf, &recon_archive_alloc);
         goto next;
 
 next:
@@ -750,7 +760,7 @@ next:
     if (dest != 0) {
         ((one_t)((void *)FileOutStream_CreateVTable))(output);
         if (((one_t)((void *)File_Construct))(output + 8),
-            ((int (*)(void *, const char *))((void *)OutFile_Open))(output + 8, dest) == 0) {
+            ((int (*)(void *, const char *))((void *)OutFile_Open))(output + 8, dest) != 0) {
             state_final = 1;
             goto clear_direct;
         }
@@ -771,30 +781,30 @@ next:
     {
         int32_t first = (int32_t)ar->FolderStartFileIndex[map];
         uint32_t last = (uint32_t)idx;
-        uint64_t sum = 0;
-        if ((uint32_t)first <= last) {
+        if ((uint32_t)first < last) {
             uint32_t i;
-            for (i = (uint32_t)first; i <= last; i++) {
-                uint8_t *r = (uint8_t *)ar->db.Files + (uint64_t)i * 0x20;
-                sum += rd32(r + 8);
-            }
+            for (i = (uint32_t)first; i < last; i++)
+                accumulated += ar->db.Files[i].Size;
         }
-        remaining = sum;
-        ARCHIVE_PROGRESS->total = sum;
+        remaining = accumulated + ar->db.Files[idx].Size;
+        ARCHIVE_PROGRESS->total = remaining;
         ARCHIVE_PROGRESS->done = 0;
     }
 
     if (class == 0) {
         void *dest = output;
         if (accumulated != 0) {
-            look->s.Skip(look, accumulated);
+            if (LookInStream_SeekTo(&look->s, selection + accumulated) != SZ_OK) {
+                state_final = 1;
+                goto clear_direct;
+            }
             ARCHIVE_PROGRESS->done = ARCHIVE_PROGRESS->done + accumulated;
             remaining -= accumulated;
         }
         while ((int64_t)remaining >= 1) {
             uint64_t requested = remaining < 0x10000 ? remaining : 0x10000;
             if (((read_t)(void *)look->s.Read)
-                    (ctx, entry_b, &requested, requested) != 0) {
+                    (ctx, entry_b, &requested, requested) != 0 || requested == 0) {
                 state_final = 1;
                 goto clear_direct;
             }
@@ -812,14 +822,18 @@ next:
     if (class == 0x30101) {
         wr64(filter + 16, 0);
         wr64(filter + 24, 0);
-        ((init_t)((void *)LzmaDec_Allocate))(filter, ((CSzCoderInfo *)(void *)source)->Props.data, (uint32_t)((CSzCoderInfo *)(void *)source)->Props.size,
+        state_final = ((init_t)((void *)LzmaDec_Allocate))(filter, ((CSzCoderInfo *)(void *)source)->Props.data, (uint32_t)((CSzCoderInfo *)(void *)source)->Props.size,
                                     obj + 24);
+        if (state_final != 0)
+            goto clear_special;
         ((one_t)((void *)LzmaDec_Init))(filter);
     } else {
         wr64(filter + 16, 0);
         wr64(filter + 24, 0);
-        ((int (*)(void *, uint8_t, void *))((void *)Lzma2Dec_Allocate))
+        state_final = ((int (*)(void *, uint8_t, void *))((void *)Lzma2Dec_Allocate))
             (filter, ((CSzCoderInfo *)(void *)source)->Props.data[0], obj + 24);
+        if (state_final != 0)
+            goto clear_special;
         ((one_t)((void *)Lzma2Dec_Init))(filter);
     }
 
@@ -855,41 +869,19 @@ next:
                  &src_len, code, &status);
         }
 
-        prev = dest_len;
+        if (state_final != 0)
+            goto clear_special;
+
+        prev = dest_len < remaining ? dest_len : remaining;
         tmp = src_len;
         remaining -= prev;
-
-        if (consumed < 1) {
-            per_write = prev;
-            counter = 0;
-        } else {
-            int64_t difference = (int64_t)consumed - (int64_t)prev;
-            if (difference >= 0) {
-                per_write = 0;
-                counter = (uint64_t)difference;
-            } else {
-                per_write = (uint64_t)(-difference);
-                counter = (uint64_t)difference;
-            }
-        }
-
-        if ((int64_t)remaining >= 0) {
+        {
+            uint64_t skipped = consumed < prev ? consumed : prev;
+            consumed -= skipped;
+            per_write = prev - skipped;
             ARCHIVE_PROGRESS->done = ARCHIVE_PROGRESS->done + prev;
             if (per_write != 0) {
-            uint8_t *p = decoded + (consumed < prev ? consumed : 0);
-                uint64_t written = out_stream->Write(output, p, per_write);
-                if (written != per_write) {
-                    state_final = 1;
-                    goto clear_special;
-                }
-            }
-        } else {
-            per_write += (uint32_t)remaining;
-            remaining = 0;
-            ARCHIVE_PROGRESS->done = ARCHIVE_PROGRESS->total;
-            if (per_write != 0) {
-                uint8_t *p = decoded + (consumed < prev ? consumed : 0);
-                uint64_t written = out_stream->Write(output, p, per_write);
+                uint64_t written = out_stream->Write(output, decoded + skipped, per_write);
                 if (written != per_write) {
                     state_final = 1;
                     goto clear_special;
@@ -897,20 +889,25 @@ next:
             }
         }
 
-        if (state_final != 0 || (reference != UINT64_MAX && remaining == 0))
+        if (remaining == 0)
             goto clear_special;
         shift_block += tmp;
-        reference -= prev;
-        if (dest_len == 0 && tmp == 0)
+        reference -= dest_len;
+        if (dest_len == 0 && tmp == 0) {
+            state_final = 1;
             goto clear_special;
+        }
     }
 
 clear_special:
     ((two_t)((void *)LzmaDec_Free))(filter, obj + 24);
 
 clear_direct:
+    if (remaining != 0)
+        state_final = 1;
     if (dest != 0) {
-        ((one_t)((void *)File_Close))(output + 8);
+        if (File_Close((CSzFile *)(void *)(output + 8)) != 0)
+            state_final = 1;
         result = (void *)(uintptr_t)(remaining == 0);
     } else {
         result = memory;
@@ -922,8 +919,10 @@ clear_listing:
     ((one_t)((void *)File_Close))(listing + 16);
 
 end:
-    if (state_final != 0 || rd32(output_size) == 0)
+    if (state_final != 0 || rd32(output_size) == 0) {
+        free(memory);
         return NULL;
+    }
     return result;
 }
 
@@ -1132,7 +1131,6 @@ int archive_7z_read_range(const char *container, const char *extension,
     uint64_t capacity_name = 0;
     uint64_t idx = 0;
     uint64_t advance_reg = 0;
-    uint32_t accumulated = 0;
     uint32_t mark_output = 0;
     uint32_t pending = dest_size;
     int32_t result;
@@ -1168,7 +1166,6 @@ int archive_7z_read_range(const char *container, const char *extension,
     advance_reg = 0;
     capacity_name = 0;
     name = 0;
-    accumulated = 0;
 
     for (;;) {
         CSzFileItem *regs = parser->db.Files;
@@ -1220,6 +1217,7 @@ int archive_7z_read_range(const char *container, const char *extension,
             uint64_t entry_size = reg->Size;
             uint32_t left;
             uint32_t threshold;
+            uint64_t entry_offset = (uint32_t)offset;
             uint64_t unpack_size;
             uint64_t resource;
 
@@ -1228,10 +1226,14 @@ int archive_7z_read_range(const char *container, const char *extension,
             pending = 0;
             if (dest == 0 || dest_size == 0)
                 goto output;
-            if (entry_size < (uint64_t)((uint32_t)offset + dest_size))
+            if (offset < 0 || entry_size < (uint64_t)(uint32_t)offset + dest_size)
                 goto error_output;
 
-            threshold = accumulated + (uint32_t)offset;
+            for (uint32_t i = parser->FolderStartFileIndex[id_resource]; i < idx; i++)
+                entry_offset += parser->db.Files[i].Size;
+            if (entry_offset > UINT32_MAX)
+                goto error_output;
+            threshold = (uint32_t)entry_offset;
             unpack_size = ((fn_unpack_size)((void *)SzFolder_GetUnpackSize))(description);
             resource = ((fn_resource)((void *)SzArEx_GetFolderStreamPos))(parser, id_resource, 0);
             ((fn_prepare)((void *)LookInStream_SeekTo))(block_output, resource);
@@ -1252,7 +1254,7 @@ int archive_7z_read_range(const char *container, const char *extension,
                     size_t chunk = left < ARCHIVE_7Z_BLOCK_BYTES ? left : ARCHIVE_7Z_BLOCK_BYTES;
                     uint64_t written;
 
-                    if (((fn_read_direct)block_output->s.Read)(block_output, block_entry, &chunk) != 0)
+                    if (((fn_read_direct)block_output->s.Read)(block_output, block_entry, &chunk) != 0 || chunk == 0)
                         break;
                     written = p->sink.write(&p->sink, block_entry, chunk);
                     if (written != chunk)
@@ -1337,12 +1339,12 @@ int archive_7z_read_range(const char *container, const char *extension,
 end_compressed:
             LzmaDec_Free(&p->decoder.decoder, &p->alloc);
             pending = p->request.remaining;
-            mark_output = 1;
+            mark_output = (result == SZ_OK);
             goto output;
         }
 
 no_matches:
-        accumulated += (uint32_t)reg->Size;
+        Buf_Free(&p->name, &recon_archive_alloc);
 next:
         idx++;
         advance_reg += sizeof(CSzFileItem);
@@ -1483,7 +1485,7 @@ int32_t archive_zip_window_sink_write(void *sink, uint8_t *src, uint32_t delta)
 typedef int64_t (*fn_lseek_16)(int32_t, int64_t, int32_t);
 typedef void *(*fn_mmap_16)(void *, uint64_t, int32_t, int32_t, int32_t, int64_t);
 typedef size_t (*fn_strlen)(const char *);
-typedef int (*fn_memcmp)(const void *, const void *, size_t);
+typedef int (*fn_strncasecmp)(const char *, const char *, size_t);
 typedef int32_t (*fn_munmap_16)(void *, uint64_t);
 
 
@@ -1499,7 +1501,7 @@ int32_t archive_zip_find_entry(int32_t descriptor, const char *name,
     static fn_lseek_16 core_lseek;
     static fn_mmap_16 core_mmap;
     static fn_strlen core_strlen;
-    static fn_memcmp core_memcmp;
+    static fn_strncasecmp core_strncasecmp;
     static fn_munmap_16 core_munmap;
     int64_t signed_size;
     uint64_t size;
@@ -1586,10 +1588,12 @@ int32_t archive_zip_find_entry(int32_t descriptor, const char *name,
             (int64_t)(uint64_t)len_file)
             goto cleanup;
 
-        if (!core_memcmp)
-            core_memcmp = (fn_memcmp)sym_libc_memcmp;
-        if (core_memcmp((const void *)(entry + 46 - (uint64_t)len_name +
-                        (uint64_t)len_file), name, len_name) == 0) {
+        if (!core_strncasecmp)
+            core_strncasecmp = (fn_strncasecmp)sym_libc_strncasecmp;
+        if (len_name != 0 && len_file > len_name &&
+            rd8((const void *)(entry + 45 + len_file - len_name)) == '.' &&
+            core_strncasecmp((const char *)(entry + 46 + len_file - len_name),
+                             name, len_name) == 0) {
             uintptr_t local = base + (uint64_t)offset_local;
             uint32_t end_data;
             uint32_t is_zero;
@@ -2137,285 +2141,293 @@ cleanup:
 
 
 
-int32_t archive_rar_memory_sink_write(int32_t mode, uint64_t *cursor, const void *src, uint64_t n)
+typedef struct rar_reader {
+    struct archive *archive;
+    ar_stream *solid_stream;
+    ar_archive *solid_archive;
+    const char *path;
+    int fd;
+    locale_t locale;
+    locale_t previous_locale;
+} rar_reader_t;
+
+static void rar_error(rar_reader_t *reader, const char *message)
 {
-
-    if (mode != 1)
-        return 0;
-
-    static void *(*s_memcpy)(void *, const void *, size_t);
-    if (!s_memcpy)
-        s_memcpy = (void *(*)(void *, const void *, size_t))sym_libc_memcpy;
-
-    ARCHIVE_PROGRESS->done = ARCHIVE_PROGRESS->done + n;
-
-    uint64_t dest = rd64(cursor);
-    s_memcpy((void *)dest, src, (size_t)n);
-
-    uint64_t dest2 = rd64(cursor);
-    wr64(cursor, dest2 + n);
-
-    return 1;
+    if (message == NULL && reader->archive != NULL)
+        message = archive_error_string(reader->archive);
+    if (message == NULL)
+        message = "Invalid or unsupported RAR archive";
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_ERROR, "reconDS", "RAR: %s", message);
+#else
+    fprintf(stderr, "RAR: %s\n", message);
+#endif
 }
 
-typedef unsigned long (*fn_fwrite_20)(const void *, unsigned long,
-                                   unsigned long, void *);
-
-int archive_rar_file_sink_write(int32_t param_1, void *param_2, const void *param_3,
-                       uint64_t param_4)
+static void rar_close(rar_reader_t *reader)
 {
-
-    if (param_1 != 1)
-        return 0;
-
-    ARCHIVE_PROGRESS->done = ARCHIVE_PROGRESS->done + param_4;
-
-    static fn_fwrite_20 core_fwrite;
-    if (!core_fwrite) core_fwrite = (fn_fwrite_20)sym_libc_fwrite;
-
-    core_fwrite(param_3, 1, param_4, param_2);
-
-    return 1;
-}
-
-#define _UNIX
-#include "dll.hpp"
-typedef void *(*fn_create_reader)(void *);
-typedef int32_t (*fn_read_entry)(void *, void *);
-typedef void (*fn_close_reader)(void *);
-typedef int32_t (*fn_process_reader)(void *, uint32_t, void *, void *);
-typedef void (*fn_install_output)(void *, void *, void *);
-typedef char *(*fn_strrchr_chk)(const char *, int32_t, uint64_t);
-typedef int32_t (*fn_strcasecmp)(const char *, const char *);
-typedef void *(*fn_malloc_21)(uint64_t);
-typedef void (*fn_free_21)(void *);
-typedef int32_t (*fn_fclose_21)(void *);
-
-
-void *archive_rar_extract_by_extension(const char *param_1, const char *extension,
-                         uint32_t *output_size, const char *param_4)
-{
-
-    struct {
-        void *output;
-        struct RAROpenArchiveDataEx open_data;
-        struct RARHeaderDataEx header;
-    } frame;
-    struct RAROpenArchiveDataEx *ctx = &frame.open_data;
-    struct RARHeaderDataEx *buffer = &frame.header;
-    void *reader;
-    void *result = NULL;
-    int32_t state;
-
-    _Static_assert(sizeof frame == 14584, "rar extract frame");
-    wr32(output_size, 0);
-    memset(&ctx->ArcNameW, 0, (size_t)((unsigned char *)ctx + sizeof *ctx - (unsigned char *)&ctx->ArcNameW));
-    ctx->ArcName = (char *)param_1;
-    ctx->OpenMode = 1;
-
-    reader = ((fn_create_reader)((void *)RAROpenArchiveEx))(ctx);
-    if (ctx->OpenResult != 0)
-        goto cleanup;
-    if (((uint16_t)ctx->Flags & UINT16_C(0x185)) != 0)
-        goto cleanup;
-
-    buffer->CmtBuf = NULL;
-    state = ((fn_read_entry)((void *)RARReadHeaderEx))(reader, buffer);
-    if (state != 0)
-        goto cleanup;
-
-    for (;;) {
-        char *point = ((fn_strrchr_chk)fortify_strrchr)(
-            buffer->FileName, 0x2e, sizeof buffer->FileName);
-
-        if (point != NULL &&
-            ((fn_strcasecmp)sym_libc_strcasecmp)(point + 1, extension) == 0) {
-            uint32_t size = buffer->UnpSize;
-
-            wr32(output_size, size);
-            ARCHIVE_PROGRESS->total = size;
-            ARCHIVE_PROGRESS->done = 0;
-
-            if (param_4 != NULL) {
-                void *stream = nds_platform_default()->files.open(nds_platform_default()->user, 
-                    param_4, "wb");
-
-                ((fn_install_output)((void *)RARSetCallback))(
-                    reader, (void *)archive_rar_file_sink_write, stream);
-                result = ((fn_process_reader)((void *)RARProcessFile))(
-                    reader, 1, NULL, NULL) == 0 ? (void *)(uintptr_t)1 : NULL;
-                ((fn_fclose_21)sym_libc_fclose)(stream);
-                goto cleanup;
-            }
-
-            result = ((fn_malloc_21)sym_libc_malloc)(size);
-            frame.output = result;
-            if (result == NULL)
-                goto cleanup;
-
-            ((fn_install_output)((void *)RARSetCallback))(
-                reader, (void *)archive_rar_memory_sink_write, &frame.output);
-            if (((fn_process_reader)((void *)RARProcessFile))(reader, 1, NULL, NULL) == 0)
-                goto cleanup;
-
-            ((fn_free_21)sym_libc_free)(result);
-            result = NULL;
-            goto cleanup;
-        }
-
-        ((fn_process_reader)((void *)RARProcessFile))(reader, 0, NULL, NULL);
-        state = ((fn_read_entry)((void *)RARReadHeaderEx))(reader, buffer);
-        if (state != 0)
-            goto cleanup;
+    ar_close_archive(reader->solid_archive);
+    ar_close(reader->solid_stream);
+    if (reader->archive != NULL)
+        archive_read_free(reader->archive);
+    if (reader->fd >= 0)
+        close(reader->fd);
+    if (reader->locale != (locale_t)0) {
+        if (reader->previous_locale != (locale_t)0)
+            uselocale(reader->previous_locale);
+        freelocale(reader->locale);
     }
+}
 
-cleanup:
-    ((fn_close_reader)((void *)RARCloseArchive))(reader);
+static int rar_open(rar_reader_t *reader, const char *path)
+{
+    memset(reader, 0, sizeof *reader);
+    reader->fd = -1;
+    reader->path = path;
+    if (path == NULL)
+        return -1;
+    reader->locale = newlocale(LC_CTYPE_MASK, "C.UTF-8", (locale_t)0);
+    if (reader->locale == (locale_t)0)
+        reader->locale = newlocale(LC_CTYPE_MASK, "en_US.UTF-8", (locale_t)0);
+    if (reader->locale == (locale_t)0) {
+        rar_error(reader, "UTF-8 locale is unavailable");
+        return -1;
+    }
+    reader->previous_locale = uselocale(reader->locale);
+    if (reader->previous_locale == (locale_t)0) {
+        rar_error(reader, "Cannot select UTF-8 locale");
+        return -1;
+    }
+    reader->fd = recon_archive_open(path, O_RDONLY);
+    if (reader->fd < 0) {
+        rar_error(reader, "Cannot open archive");
+        return -1;
+    }
+    reader->archive = archive_read_new();
+    if (reader->archive == NULL)
+        return -1;
+    if (archive_read_support_filter_none(reader->archive) != ARCHIVE_OK ||
+        archive_read_support_format_rar(reader->archive) != ARCHIVE_OK ||
+        archive_read_support_format_rar5(reader->archive) != ARCHIVE_OK ||
+        archive_read_open_fd(reader->archive, reader->fd, 65536) != ARCHIVE_OK) {
+        rar_error(reader, NULL);
+        return -1;
+    }
+    return 0;
+}
+
+static int rar_find_solid(rar_reader_t *reader, const char *extension, uint32_t *size)
+{
+    archive_read_free(reader->archive);
+    reader->archive = NULL;
+    close(reader->fd);
+    reader->fd = -1;
+    reader->solid_stream = ar_open_file(reader->path);
+    if (reader->solid_stream == NULL)
+        return -1;
+    reader->solid_archive = ar_open_rar_archive(reader->solid_stream);
+    if (reader->solid_archive == NULL)
+        return -1;
+    while (ar_parse_entry(reader->solid_archive)) {
+        const char *name = ar_entry_get_name(reader->solid_archive);
+        const char *suffix = name == NULL ? NULL : strrchr(name, '.');
+        if (suffix != NULL && strcasecmp(suffix + 1, extension) == 0) {
+            size_t length = ar_entry_get_size(reader->solid_archive);
+            if (length > UINT32_MAX) {
+                rar_error(reader, "RAR entry size exceeds the core's 32-bit file limit");
+                return -1;
+            }
+            *size = (uint32_t)length;
+            return 0;
+        }
+    }
+    if (!ar_at_eof(reader->solid_archive))
+        rar_error(reader, "Cannot read solid RAR entry");
+    return -1;
+}
+
+static int rar_find(rar_reader_t *reader, const char *extension, uint32_t *size)
+{
+    struct archive_entry *entry;
+    int status;
+    if (extension == NULL)
+        return -1;
+    while ((status = archive_read_next_header(reader->archive, &entry)) == ARCHIVE_OK) {
+        const char *name = archive_entry_pathname_utf8(entry);
+        const char *suffix = name == NULL ? NULL : strrchr(name, '.');
+        if (archive_entry_filetype(entry) == AE_IFREG && suffix != NULL &&
+            strcasecmp(suffix + 1, extension) == 0) {
+            int64_t length = archive_entry_size(entry);
+            if (archive_entry_is_encrypted(entry)) {
+                rar_error(reader, "Encrypted RAR entries are unsupported");
+                return -1;
+            }
+            if (!archive_entry_size_is_set(entry) || length < 0 || length > UINT32_MAX) {
+                rar_error(reader, "RAR entry size exceeds the core's 32-bit file limit");
+                return -1;
+            }
+            *size = (uint32_t)length;
+            return 0;
+        }
+        if (archive_read_data_skip(reader->archive) != ARCHIVE_OK) {
+            rar_error(reader, NULL);
+            return -1;
+        }
+    }
+    const char *error = archive_error_string(reader->archive);
+    if (status == ARCHIVE_FATAL && error != NULL &&
+        strcmp(error, "RAR solid archive support unavailable") == 0)
+        return rar_find_solid(reader, extension, size);
+    if (status != ARCHIVE_EOF)
+        rar_error(reader, NULL);
+    return -1;
+}
+
+static int rar_read_bytes(rar_reader_t *reader, void *destination, uint32_t size)
+{
+    if (reader->solid_archive != NULL) {
+        if (ar_entry_uncompress(reader->solid_archive, destination, size))
+            return 0;
+        rar_error(reader, "Cannot decompress solid RAR entry or checksum mismatch");
+        return -1;
+    }
+    uint8_t *cursor = destination;
+    while (size != 0) {
+        size_t count = size < 65536u ? size : 65536u;
+        la_ssize_t read = archive_read_data(reader->archive, cursor, count);
+        if (read <= 0) {
+            rar_error(reader, read == 0 ? "Truncated RAR entry" : NULL);
+            return -1;
+        }
+        cursor += read;
+        size -= (uint32_t)read;
+    }
+    return 0;
+}
+
+static int rar_finish_entry(rar_reader_t *reader)
+{
+    uint8_t extra;
+    if (reader->solid_archive != NULL)
+        return ar_entry_get_size(reader->solid_archive) == 0 ?
+            rar_read_bytes(reader, &extra, 0) : 0;
+    la_ssize_t read = archive_read_data(reader->archive, &extra, 1);
+    if (read != 0) {
+        rar_error(reader, read > 0 ? "RAR entry exceeds its declared size" : NULL);
+        return -1;
+    }
+    return 0;
+}
+
+void *archive_rar_extract_by_extension(const char *path, const char *extension,
+                                       uint32_t *output_size, const char *destination)
+{
+    rar_reader_t reader;
+    uint32_t size = 0;
+    void *result = NULL;
+    FILE *stream = NULL;
+    if (output_size == NULL)
+        return NULL;
+    *output_size = 0;
+    if (rar_open(&reader, path) != 0 || rar_find(&reader, extension, &size) != 0)
+        goto done;
+    ARCHIVE_PROGRESS->total = size;
+    ARCHIVE_PROGRESS->done = 0;
+    if (destination != NULL) {
+        const nds_platform_t *platform = nds_platform_default();
+        uint8_t buffer[65536];
+        uint32_t remaining = size;
+        stream = platform->files.open(platform->user, destination, "wb");
+        if (stream == NULL) {
+            rar_error(&reader, "Cannot open extraction destination");
+            goto done;
+        }
+        while (remaining != 0) {
+            uint32_t count = remaining < sizeof buffer ? remaining : sizeof buffer;
+            if (rar_read_bytes(&reader, buffer, count) != 0)
+                goto done;
+            if (fwrite(buffer, 1, count, stream) != count) {
+                rar_error(&reader, "Cannot write extraction destination");
+                goto done;
+            }
+            remaining -= count;
+            ARCHIVE_PROGRESS->done += count;
+        }
+        int closed = fclose(stream);
+        stream = NULL;
+        if (closed != 0) {
+            rar_error(&reader, "Cannot finish extraction destination");
+            goto done;
+        }
+        if (rar_finish_entry(&reader) != 0)
+            goto done;
+        result = (void *)(uintptr_t)1;
+    } else {
+        result = malloc(size != 0 ? size : 1);
+        if (result == NULL)
+            goto done;
+        uint32_t position = 0;
+        while (position < size) {
+            uint32_t count = size - position < 65536u ? size - position : 65536u;
+            if (rar_read_bytes(&reader, (uint8_t *)result + position, count) != 0 ||
+                (position + count == size && rar_finish_entry(&reader) != 0)) {
+                free(result);
+                result = NULL;
+                goto done;
+            }
+            position += count;
+            ARCHIVE_PROGRESS->done += count;
+        }
+        if (size == 0 && rar_finish_entry(&reader) != 0) {
+            free(result);
+            result = NULL;
+            goto done;
+        }
+    }
+    *output_size = size;
+done:
+    if (stream != NULL)
+        fclose(stream);
+    rar_close(&reader);
     return result;
 }
-#undef _UNIX
 
-typedef void *(*fn_memcpy_22)(void *, const void *, uint64_t);
-
-int archive_rar_window_sink_write(const unsigned char *param_1, int param_2)
+int archive_rar_read_range(const char *path, const char *extension,
+                           uint32_t *output_size, void *destination, int length, int offset)
 {
-
-    archive_rar_window_sink_t *g = &ARCHIVE_PROGRESS->rar_sink;
-
-    uint32_t pos_orig = g->position;
-    uint32_t limit    = g->threshold;
-
-    uint32_t pos_new = pos_orig + (uint32_t)param_2;
-    g->position = pos_new;
-
-    uint32_t excess = pos_new - limit;
-    uint32_t free_final;
-
-    if (pos_new >= limit) {
-
-        uint32_t avail = g->room;
-
-        uint8_t *ptr = g->destination;
-
-        uint32_t before_threshold = limit - pos_orig;
-        uint32_t copy = (excess > avail) ? avail : excess;
-
-        const void *src = (const void *)(param_1 + before_threshold);
-        void *dst = ptr;
-
-        ((fn_memcpy_22)sym_libc_memcpy)(dst, src, (uint64_t)copy);
-
-        free_final = avail - copy;
-        uint8_t *ptr_updated = ptr + copy;
-        uint32_t limit_updated = limit + copy;
-
-        g->room = free_final;
-        g->destination = ptr_updated;
-        g->threshold = limit_updated;
-    } else {
-
-        free_final = g->room;
+    rar_reader_t reader;
+    uint32_t size = 0;
+    int result = -1;
+    if (output_size == NULL)
+        return -1;
+    *output_size = 0;
+    if (length < 0 || offset < 0)
+        return -1;
+    if (rar_open(&reader, path) != 0 || rar_find(&reader, extension, &size) != 0)
+        goto done;
+    *output_size = size;
+    if (destination == NULL || length == 0) {
+        result = 0;
+        goto done;
     }
-
-    return (free_final != 0) ? 1 : 0;
+    if ((uint32_t)offset > size || (uint32_t)length > size - (uint32_t)offset)
+        goto done;
+    uint8_t buffer[65536];
+    uint32_t skip = (uint32_t)offset;
+    while (skip != 0) {
+        uint32_t count = skip < sizeof buffer ? skip : sizeof buffer;
+        if (rar_read_bytes(&reader, buffer, count) != 0)
+            goto done;
+        skip -= count;
+    }
+    if (rar_read_bytes(&reader, destination, (uint32_t)length) != 0)
+        goto done;
+    if ((uint32_t)offset + (uint32_t)length == size && rar_finish_entry(&reader) != 0)
+        goto done;
+    result = 0;
+done:
+    rar_close(&reader);
+    return result;
 }
-
-#define _UNIX
-#include "dll.hpp"
-typedef void (*fnp_rar_set_process_data_proc)(unsigned char *obj, int (*v)(const unsigned char *, int));
-typedef void *(*fn_rar_open)(void *desc);
-typedef int   (*fn_header)(void *arch, void *info);
-typedef int   (*fn_process)(void *arch, int op,
-                             void *path, void *name);
-typedef int   (*fn_rar_close)(void *arch);
-extern void rar_set_process_data_proc(unsigned char *obj, uint64_t v);
-#define OFF_CALLBACK 0x138ea8
-
-
-int archive_rar_read_range(const char *name_file, const char *extension,
-                       uint32_t *output_size, void *dest,
-                       int len, int offset)
-{
-
-    static char *(*p_strrchr_chk)(const char *, int, size_t);
-    static int   (*p_strcasecmp)(const char *, const char *);
-
-    struct RAROpenArchiveDataEx desc;
-    struct RARHeaderDataEx info;
-    archive_rar_window_sink_t *g = &ARCHIVE_PROGRESS->rar_sink;
-    const char    *name;
-    void          *arch;
-    int            ret;
-    uint32_t       size;
-
-    if (!p_strrchr_chk) {
-        p_strrchr_chk = (char *(*)(const char *, int, size_t))
-                        fortify_strrchr;
-        p_strcasecmp  = (int (*)(const char *, const char *))
-                        sym_libc_strcasecmp;
-    }
-
-    wr32(output_size, 0);
-
-    memset(&desc, 0, sizeof desc);
-    desc.ArcName = (char *)name_file;
-    desc.OpenMode = 1;
-
-    arch = ((fn_rar_open)((void *)RAROpenArchiveEx))(&desc);
-
-    if (desc.OpenResult != 0) { ret = -1; goto close_fn; }
-
-    if (((uint16_t)desc.Flags & 0x185u) != 0) { ret = -1; goto close_fn; }
-
-    info.CmtBuf = NULL;
-
-    if (((fn_header)((void *)RARReadHeaderEx))(arch, &info) != 0) { ret = -1; goto close_fn; }
-
-    name = info.FileName;
-
-    for (;;) {
-
-        char *point = p_strrchr_chk(name, 0x2e, 0x400);
-
-        if (point != NULL && p_strcasecmp(point + 1, extension) == 0)
-            break;
-
-        ((fn_process)((void *)RARProcessFile))(arch, 0, NULL, NULL);
-
-        if (((fn_header)((void *)RARReadHeaderEx))(arch, &info) != 0) { ret = -1; goto close_fn; }
-    }
-
-    size = info.UnpSize;
-    ret = 0;
-    wr32(output_size, size);
-
-    if (dest == NULL) goto close_fn;
-    if (len == 0)   goto close_fn;
-
-    if ((uint32_t)((uint32_t)offset + (uint32_t)len) > size) {
-        ret = -1;
-        goto close_fn;
-    }
-
-    g->destination = (uint8_t *)dest;
-    g->room = (uint32_t)len;
-    g->threshold = (uint32_t)offset;
-    g->position = 0;
-
-    ((fnp_rar_set_process_data_proc)((void *)RARSetProcessDataProc))((unsigned char *)arch,
-                       archive_rar_window_sink_write);
-
-    ((fn_process)((void *)RARProcessFile))(arch, 1, NULL, NULL);
-
-    ret = (g->room != 0) ? -1 : 0;
-
-close_fn:
-
-    ((fn_rar_close)((void *)RARCloseArchive))(arch);
-
-    return ret;
-}
-#undef _UNIX
-#undef OFF_CALLBACK
 
 archive_progress_t archive_progress_state;

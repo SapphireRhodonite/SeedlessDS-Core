@@ -1,5 +1,8 @@
 #include <stdint.h>
 #include <string.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include "hires_runtime.h"
 #include <stddef.h>
 #include "blob_symbols.h"
@@ -1357,6 +1360,21 @@ void gpu3d_gxfifo_push_word(gpu3d_t *state, unsigned word) {
 #define FLUSH_FN_OFF 0x63aecu
 
 static void copy_words_fwd(uint8_t *dst, const uint8_t *src, uint32_t n) {
+#if defined(__ARM_NEON)
+    if (n >= 4u) {
+        uintptr_t d = (uintptr_t)dst;
+        uintptr_t s = (uintptr_t)src;
+        uint64_t bytes = (uint64_t)n * 4u;
+        if ((d >= s ? d - s : s - d) >= bytes) {
+            do {
+                vst1q_u8(dst, vld1q_u8(src));
+                src += 16;
+                dst += 16;
+                n -= 4u;
+            } while (n >= 4u);
+        }
+    }
+#endif
     uint32_t i;
     for (i = 0; i < n; i++) {
         uint32_t v = rd32(src);

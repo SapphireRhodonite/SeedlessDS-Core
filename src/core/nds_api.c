@@ -58,10 +58,10 @@ void nds_pause(nds_t *nds, int paused)
 
     (void)nds;
 
-    if (g->pause_request == want)
+    if (__atomic_load_n(&g->pause_request, __ATOMIC_ACQUIRE) == want)
         return;
 
-    g->pause_request = want;
+    __atomic_store_n(&g->pause_request, want, __ATOMIC_RELEASE);
 
     if ((int32_t)(uint32_t)g->config_bits < 0) {
         if (want == 0)
@@ -69,6 +69,7 @@ void nds_pause(nds_t *nds, int paused)
         else
             audio_out_flush_queues();
     }
+    if (want == 0) input_pause_notify();
 }
 
 void nds_quit(nds_t *nds)
@@ -79,8 +80,9 @@ void nds_quit(nds_t *nds)
 
     audio_out_flush_queues();
     g->lid_closed = 0;
-    g->quit_request = 1;
-    g->pause_request = 0;
+    __atomic_store_n(&g->quit_request, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g->pause_request, 0, __ATOMIC_RELEASE);
+    input_pause_notify();
 }
 
 #define CONFIG_BUTTON_PROFILE_SHIFT 32

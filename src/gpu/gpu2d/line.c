@@ -24,6 +24,7 @@ extern void *gpu2d_line_process_range_0(unsigned char *obj, uint32_t start, uint
 
 
 void gpu2d_line_finish(uint8_t *ctx, uint32_t line) {
+    gpu3d_raster_frame_finish_pending();
 
     gpu_output_t *output = GPU_OUTPUT_OF(ctx);
     vram_map_t *vram = (vram_map_t *)ctx;
@@ -70,6 +71,11 @@ void gpu2d_line_finish(uint8_t *ctx, uint32_t line) {
     uint32_t count = output->capture.lines_done;
 
     if (line == LAST && count == 0) {
+        extern int recon_compose_pair_shared(gpu_t *, void *);
+        if (recon_compose_pair_shared((gpu_t *)ctx, output->capture_shadow)) {
+            output->capture.lines_done = (uint16_t)(line + 1);
+            return;
+        }
 
         fn_mtx    lock = nds_platform_default()->threads.mutex_lock;
         fn_mtx    unlock = nds_platform_default()->threads.mutex_unlock;
@@ -178,9 +184,70 @@ static void a565_local(uint8_t r, uint8_t v, uint8_t z, uint8_t *low, uint8_t *h
     *low = (uint8_t)(((uint8_t)(v << 5) & 0xe0u) | ((uint8_t)(z >> 1) & 0x1fu));
 }
 
+#ifdef __ARM_NEON
+static __attribute__((noinline)) int expand_native_row_rgba4(uint8_t *dst,
+        const uint8_t *source, uint32_t merge, uint32_t mult, uint32_t sum)
+{
+    uintptr_t destination = (uintptr_t)dst;
+    uintptr_t origin = (uintptr_t)source;
+    if (destination >= origin ? destination - origin < 3u * PLANE
+                              : origin - destination < WIDTH * 16u)
+        return 0;
+
+    uint32_t *output = (uint32_t *)dst;
+    uint16x8_t bias = vdupq_n_u16((uint16_t)sum);
+    for (unsigned i = 0; i < WIDTH; i += 16u) {
+        uint8x16_t red = vshlq_n_u8(vld1q_u8(source + i), 2);
+        uint8x16_t green = vshlq_n_u8(vld1q_u8(source + PLANE + i), 2);
+        uint8x16_t blue = vshlq_n_u8(vld1q_u8(source + 2u * PLANE + i), 2);
+        if (merge) {
+            uint16x8_t red_lo = vaddq_u16(bias, vmulq_n_u16(vmovl_u8(vget_low_u8(red)), (uint8_t)mult));
+            uint16x8_t red_hi = vaddq_u16(bias, vmulq_n_u16(vmovl_high_u8(red), (uint8_t)mult));
+            red = vcombine_u8(vshrn_n_u16(red_lo, 5), vshrn_n_u16(red_hi, 5));
+            uint16x8_t green_lo = vaddq_u16(bias, vmulq_n_u16(vmovl_u8(vget_low_u8(green)), (uint8_t)mult));
+            uint16x8_t green_hi = vaddq_u16(bias, vmulq_n_u16(vmovl_high_u8(green), (uint8_t)mult));
+            green = vcombine_u8(vshrn_n_u16(green_lo, 5), vshrn_n_u16(green_hi, 5));
+            uint16x8_t blue_lo = vaddq_u16(bias, vmulq_n_u16(vmovl_u8(vget_low_u8(blue)), (uint8_t)mult));
+            uint16x8_t blue_hi = vaddq_u16(bias, vmulq_n_u16(vmovl_high_u8(blue), (uint8_t)mult));
+            blue = vcombine_u8(vshrn_n_u16(blue_lo, 5), vshrn_n_u16(blue_hi, 5));
+        }
+        uint8x16_t rg_low = vzip1q_u8(red, green);
+        uint8x16_t rg_high = vzip2q_u8(red, green);
+        uint8x16_t ba_low = vzip1q_u8(blue, vdupq_n_u8(0xff));
+        uint8x16_t ba_high = vzip2q_u8(blue, vdupq_n_u8(0xff));
+        uint32x4_t pixels;
+        uint32x4x4_t repeated;
+        pixels = vreinterpretq_u32_u16(vzip1q_u16(vreinterpretq_u16_u8(rg_low), vreinterpretq_u16_u8(ba_low)));
+        repeated.val[0] = pixels; repeated.val[1] = pixels;
+        repeated.val[2] = pixels; repeated.val[3] = pixels;
+        vst4q_u32(output + 0u, repeated);
+        pixels = vreinterpretq_u32_u16(vzip2q_u16(vreinterpretq_u16_u8(rg_low), vreinterpretq_u16_u8(ba_low)));
+        repeated.val[0] = pixels; repeated.val[1] = pixels;
+        repeated.val[2] = pixels; repeated.val[3] = pixels;
+        vst4q_u32(output + 16u, repeated);
+        pixels = vreinterpretq_u32_u16(vzip1q_u16(vreinterpretq_u16_u8(rg_high), vreinterpretq_u16_u8(ba_high)));
+        repeated.val[0] = pixels; repeated.val[1] = pixels;
+        repeated.val[2] = pixels; repeated.val[3] = pixels;
+        vst4q_u32(output + 32u, repeated);
+        pixels = vreinterpretq_u32_u16(vzip2q_u16(vreinterpretq_u16_u8(rg_high), vreinterpretq_u16_u8(ba_high)));
+        repeated.val[0] = pixels; repeated.val[1] = pixels;
+        repeated.val[2] = pixels; repeated.val[3] = pixels;
+        vst4q_u32(output + 48u, repeated);
+        output += 64;
+    }
+    return 1;
+
+}
+#endif
+
 static void row_n(uint8_t *dst, uint8_t *const *g, unsigned n, unsigned ef,
                    unsigned r, uint32_t bpp,
                    uint32_t merge, uint32_t mult, uint32_t sum) {
+#ifdef __ARM_NEON
+    if (bpp == 4u && n == 4u && ef <= 1u &&
+        expand_native_row_rgba4(dst, g[0], merge, mult, sum))
+        return;
+#endif
     uint32_t m = (uint8_t)mult;
     uint32_t sm = (uint16_t)sum;
 
@@ -364,6 +431,70 @@ static uint32_t half_of_row(const uint8_t *ctx, uint32_t bpp, unsigned wr)
     return mid;
 }
 
+#ifdef __ARM_NEON
+static __attribute__((noinline)) int expand_native_rows_rgba4(uint8_t *dst,
+        uint8_t *const *groups, uint32_t stride, uint32_t merge,
+        uint32_t mult, uint32_t sum)
+{
+    if (stride < WIDTH * 16u) return 0;
+    const uint8_t *source = groups[0];
+    uintptr_t destination = (uintptr_t)dst;
+    uintptr_t origin = (uintptr_t)source;
+    uintptr_t metadata = (uintptr_t)groups;
+    uint64_t output_size = (uint64_t)stride * 3u + WIDTH * 16u;
+    if (destination >= origin ? destination - origin < 3u * PLANE
+                              : (uint64_t)(origin - destination) < output_size)
+        return 0;
+    if (destination >= metadata ? destination - metadata < sizeof(groups[0])
+                                : (uint64_t)(metadata - destination) < output_size)
+        return 0;
+
+    uint16x8_t bias = vdupq_n_u16((uint16_t)sum);
+    for (unsigned i = 0; i < WIDTH; i += 16u) {
+        uint8x16_t red = vshlq_n_u8(vld1q_u8(source + i), 2);
+        uint8x16_t green = vshlq_n_u8(vld1q_u8(source + PLANE + i), 2);
+        uint8x16_t blue = vshlq_n_u8(vld1q_u8(source + 2u * PLANE + i), 2);
+        if (merge) {
+            uint16x8_t red_lo = vaddq_u16(bias, vmulq_n_u16(vmovl_u8(vget_low_u8(red)), (uint8_t)mult));
+            uint16x8_t red_hi = vaddq_u16(bias, vmulq_n_u16(vmovl_high_u8(red), (uint8_t)mult));
+            red = vcombine_u8(vshrn_n_u16(red_lo, 5), vshrn_n_u16(red_hi, 5));
+            uint16x8_t green_lo = vaddq_u16(bias, vmulq_n_u16(vmovl_u8(vget_low_u8(green)), (uint8_t)mult));
+            uint16x8_t green_hi = vaddq_u16(bias, vmulq_n_u16(vmovl_high_u8(green), (uint8_t)mult));
+            green = vcombine_u8(vshrn_n_u16(green_lo, 5), vshrn_n_u16(green_hi, 5));
+            uint16x8_t blue_lo = vaddq_u16(bias, vmulq_n_u16(vmovl_u8(vget_low_u8(blue)), (uint8_t)mult));
+            uint16x8_t blue_hi = vaddq_u16(bias, vmulq_n_u16(vmovl_high_u8(blue), (uint8_t)mult));
+            blue = vcombine_u8(vshrn_n_u16(blue_lo, 5), vshrn_n_u16(blue_hi, 5));
+        }
+        uint8x16_t rg_low = vzip1q_u8(red, green);
+        uint8x16_t rg_high = vzip2q_u8(red, green);
+        uint8x16_t ba_low = vzip1q_u8(blue, vdupq_n_u8(0xff));
+        uint8x16_t ba_high = vzip2q_u8(blue, vdupq_n_u8(0xff));
+        uint32x4x4_t pixels;
+        pixels.val[0] = vreinterpretq_u32_u16(vzip1q_u16(vreinterpretq_u16_u8(rg_low), vreinterpretq_u16_u8(ba_low)));
+        pixels.val[1] = vreinterpretq_u32_u16(vzip2q_u16(vreinterpretq_u16_u8(rg_low), vreinterpretq_u16_u8(ba_low)));
+        pixels.val[2] = vreinterpretq_u32_u16(vzip1q_u16(vreinterpretq_u16_u8(rg_high), vreinterpretq_u16_u8(ba_high)));
+        pixels.val[3] = vreinterpretq_u32_u16(vzip2q_u16(vreinterpretq_u16_u8(rg_high), vreinterpretq_u16_u8(ba_high)));
+        for (unsigned row = 0; row < 4u; row++) {
+            uint32_t *output = (uint32_t *)(dst + (size_t)row * stride + (size_t)i * 16u);
+            uint32x4x4_t repeated;
+            repeated.val[0] = pixels.val[0]; repeated.val[1] = pixels.val[0];
+            repeated.val[2] = pixels.val[0]; repeated.val[3] = pixels.val[0];
+            vst4q_u32(output + 0u, repeated);
+            repeated.val[0] = pixels.val[1]; repeated.val[1] = pixels.val[1];
+            repeated.val[2] = pixels.val[1]; repeated.val[3] = pixels.val[1];
+            vst4q_u32(output + 16u, repeated);
+            repeated.val[0] = pixels.val[2]; repeated.val[1] = pixels.val[2];
+            repeated.val[2] = pixels.val[2]; repeated.val[3] = pixels.val[2];
+            vst4q_u32(output + 32u, repeated);
+            repeated.val[0] = pixels.val[3]; repeated.val[1] = pixels.val[3];
+            repeated.val[2] = pixels.val[3]; repeated.val[3] = pixels.val[3];
+            vst4q_u32(output + 48u, repeated);
+        }
+    }
+    return 1;
+}
+#endif
+
 static void output_row(uint8_t *ctx, uint8_t *dst, uint8_t *pl, uint8_t *const *g,
                         unsigned wr, unsigned ef, uint32_t bpp, uint32_t doubled,
                         uint32_t mid)
@@ -401,6 +532,11 @@ static void output_row(uint8_t *ctx, uint8_t *dst, uint8_t *pl, uint8_t *const *
                     gpu2d_compose_extract_alpha_plane_c200(g[2], g[3], dst + mid, mult, sum);
                 }
             } else {
+#ifdef __ARM_NEON
+                if (wr == 4u && ef <= 1u && bpp == 4u &&
+                    expand_native_rows_rgba4(dst, g, mid, 1u, mult, sum))
+                    return;
+#endif
                 for (unsigned r = 0; r < wr; r++)
                     row_n(dst + (size_t)r * mid, g, wr, ef, r, bpp, 1u, mult, sum);
             }
@@ -420,11 +556,63 @@ static void output_row(uint8_t *ctx, uint8_t *dst, uint8_t *pl, uint8_t *const *
                 gpu2d_compose_extract_alpha_plane_bf60(g[2], g[3], dst + mid);
             }
         } else {
+#ifdef __ARM_NEON
+            if (wr == 4u && ef <= 1u && bpp == 4u &&
+                expand_native_rows_rgba4(dst, g, mid, 0u, 0u, 0u))
+                return;
+#endif
             for (unsigned r = 0; r < wr; r++)
                 row_n(dst + (size_t)r * mid, g, wr, ef, r, bpp, 0u, 0u, 0u);
         }
     }
 }
+
+#ifdef __ARM_NEON
+static inline uint32x4x2_t rgb555_pixels8(uint16x8_t input, uint16x8_t alpha)
+{
+    uint16x8_t red_green = vsriq_n_u16(vshlq_n_u16(input, 6), vshlq_n_u16(input, 11), 8);
+    red_green = vbicq_u16(red_green, vdupq_n_u16(0x0700u));
+    uint16x8_t blue = vandq_u16(vshrq_n_u16(input, 7), vdupq_n_u16(0x00f8u));
+    uint16x8x2_t packed = vzipq_u16(red_green, vorrq_u16(blue, alpha));
+    uint32x4x2_t result;
+    result.val[0] = vreinterpretq_u32_u16(packed.val[0]);
+    result.val[1] = vreinterpretq_u32_u16(packed.val[1]);
+    return result;
+}
+
+static inline int vram_output_is_separate(const uint8_t *dst,
+        const uint8_t *source, uint32_t stride)
+{
+    uintptr_t output = (uintptr_t)dst;
+    uintptr_t input = (uintptr_t)source;
+    uint64_t output_size = (uint64_t)stride * 3u + 4096u;
+    return input >= output ? (uint64_t)(input - output) >= output_size
+                           : (uint64_t)(output - input) >= 8192u;
+}
+
+static __attribute__((noinline)) void output_vram_row_rgba4(uint8_t *dst,
+        const uint8_t *source, uint32_t stride)
+{
+    const uint16_t *input = (const uint16_t *)source;
+    const uint16x8_t zero = vdupq_n_u16(0u);
+    const uint16x8_t alpha = vcombine_u16(vdup_n_u16(0xff00u), vdup_n_u16(0u));
+    for (unsigned row = 0; row < 4u; row++) {
+        const uint16_t *s = input + row * 4u * WIDTH;
+        uint32_t *out = (uint32_t *)(dst + (size_t)row * stride);
+#pragma clang loop unroll_count(2)
+        for (unsigned x = 0; x < WIDTH; x += 8u) {
+            uint32x4x2_t p0 = rgb555_pixels8(vld1q_u16(s + x), alpha);
+            uint32x4x2_t p1 = rgb555_pixels8(vld1q_u16(s + WIDTH + x), alpha);
+            uint32x4x2_t p2 = rgb555_pixels8(vld1q_u16(s + 2u * WIDTH + x), zero);
+            uint32x4x2_t p3 = rgb555_pixels8(vld1q_u16(s + 3u * WIDTH + x), zero);
+            uint32x4x4_t first = {{p0.val[0], p1.val[0], p2.val[0], p3.val[0]}};
+            uint32x4x4_t second = {{p0.val[1], p1.val[1], p2.val[1], p3.val[1]}};
+            vst4q_u32(out + x * 4u, first);
+            vst4q_u32(out + (x + 4u) * 4u, second);
+        }
+    }
+}
+#endif
 
 void gpu2d_line_finish_work(uint8_t *shadow, recon_b2_job *t)
 {
@@ -642,23 +830,43 @@ void gpu2d_line_render_full(uint8_t *ctx, uint8_t *dst, uint32_t line, gpu_outpu
 
     case 2: {
 
+        uint32_t k = (disp >> 18) & 3u;
+        int has_shadow = doubled && cap
+            && (cap->bank_texture_bits[k] & (1u << ((line >> 5) & 31)));
+        unsigned s0v = 0u;
+        uint8_t *v = 0;
+        if (has_shadow) {
+            s0v = recon_s0_shadow();
+            const unsigned shadow_stride = recon_shadow_stride();
+            v = cap->capture_shadow[k]
+              + (size_t)(line * shadow_stride) * 512u;
+
+            ef = wr;
+#ifdef __ARM_NEON
+            uint32_t bright = ((const gpu2d_engine_t *)ctx)->master_bright;
+            uint32_t bright_mode = bright >> 14;
+            if (wr == 4u && bpp == 4u && s0v == 0u && shadow_stride == 16u
+                && rd32(state + E_GHOST) == 0u
+                && (bright_mode == 0u || bright_mode == 3u
+                    || ((bright_mode == 1u || bright_mode == 2u) && (bright & 31u) == 0u))) {
+                uint32_t stride = half_of_row(ctx, bpp, wr);
+                if (vram_output_is_separate(dst, v, stride)) {
+                    output_vram_row_rgba4(dst, v, stride);
+                    if (has_cap)
+                        gpu2d_compose_render_line(ctx, pl + (size_t)NS * GROUP, line, cap, doubled);
+                    return;
+                }
+            }
+#endif
+        }
+
         gpu2d_compose_split_rgb_planes(pl, (const uint16_t *)(((const gpu2d_engine_t *)ctx)->display_vram_bank
                                    + (size_t)(line << 8) * 2));
-        if (doubled && has_cap) {
-            uint32_t k = (disp >> 18) & 3u;
-            if (cap->bank_texture_bits[k] & (1u << ((line >> 5) & 31))) {
+        if (has_shadow) {
+            for (unsigned i = s0v; i < NS; i++) {
+                g[i] = pl + (size_t)i * GROUP;
 
-                const unsigned s0v = recon_s0_shadow();
-                const unsigned shadow_stride = recon_shadow_stride();
-                uint8_t *v = cap->capture_shadow[k]
-                           + (size_t)(line * shadow_stride) * 512u;
-
-                ef = wr;
-                for (unsigned i = s0v; i < NS; i++) {
-                    g[i] = pl + (size_t)i * GROUP;
-
-                    gpu2d_compose_split_rgb_planes(g[i], (const uint16_t *)(v + (size_t)(i - s0v) * 0x200));
-                }
+                gpu2d_compose_split_rgb_planes(g[i], (const uint16_t *)(v + (size_t)(i - s0v) * 0x200));
             }
         }
 

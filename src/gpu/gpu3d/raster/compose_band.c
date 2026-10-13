@@ -1800,7 +1800,7 @@ void gpu3d_raster_band_compose_scaled_fogged(void *param_1, void *param_2, uint3
 }
 
 
-void gpu3d_raster_band_compose_block_pairs(gpu_t *machine)
+static void compose_block_pairs_range(gpu_t *machine, unsigned first, unsigned last)
 {
 
     gpu_t *gpu = machine;
@@ -1808,7 +1808,7 @@ void gpu3d_raster_band_compose_block_pairs(gpu_t *machine)
 
     gpu3d_t *ctx = GPU3D_BAND_HEADER(recon_ctx3d_base((unsigned char *)gpu))->gpu3d;
 
-    unsigned char *layer = tb + RECON_ARENA_B0;
+    unsigned char *layer = tb + RECON_ARENA_B0 + first * 2u * RECON_ROW_STEP;
     unsigned char *block0 = tb + RECON_ARENA_A0;
     unsigned char *block1 = block0 + RECON_ROW_STEP;
     unsigned char *block2 = block0 + 2u * RECON_ROW_STEP;
@@ -1818,7 +1818,7 @@ void gpu3d_raster_band_compose_block_pairs(gpu_t *machine)
     uint32_t field = cfg->disp3dcnt;
     uint16_t height_base = ctx->fog_offset;
     uint32_t width = cfg->clear_depth_word;
-    unsigned char *output = cfg->frame_front + RECON_3D_BAND;
+    unsigned char *output = cfg->frame_front + (first + 1u) * RECON_3D_BAND;
     uint32_t shift = (field >> 8) & 0x0fu;
     uint32_t height = (uint32_t)(height_base & 0x7fffu) +
                     (0x400u >> (shift & 31u));
@@ -1827,7 +1827,7 @@ void gpu3d_raster_band_compose_block_pairs(gpu_t *machine)
     _Alignas(16) unsigned char scratch[2048];
 
     const uint64_t step_slot = 4u * RECON_ROW_STEP;
-    for (uint64_t d = 0; d != (RECON_BANDS - 1u) * step_slot; d += step_slot) {
+    for (uint64_t d = first * step_slot; d != last * step_slot; d += step_slot) {
         unsigned char *before = output - RECON_ROW_STEP;
 
         gpu3d_raster_fog_density_line_512((const unsigned int *)(block1 + d), scratch, (unsigned char *)ctx->fog_table,
@@ -1852,4 +1852,50 @@ void gpu3d_raster_band_compose_block_pairs(gpu_t *machine)
         output += RECON_3D_BAND;
         layer += 2u * RECON_ROW_STEP;
     }
+}
+
+_Alignas(64) static unsigned boundary_inputs[RECON_BAND_CAPACITY];
+static gpu_t *stream_gpu;
+static unsigned stream_bands;
+
+void gpu3d_raster_band_compose_begin(gpu_t *gpu, int enabled)
+{
+    stream_gpu = enabled ? gpu : 0;
+    stream_bands = enabled ? RECON_BANDS : 0u;
+    if (enabled) memset(boundary_inputs, 0, sizeof boundary_inputs);
+}
+
+static void compose_boundary_input(gpu_t *gpu, unsigned boundary, unsigned input)
+{
+    unsigned previous = __atomic_fetch_or(&boundary_inputs[boundary], input, __ATOMIC_ACQ_REL);
+    if (previous == (3u ^ input))
+        compose_block_pairs_range(gpu, boundary, boundary + 1u);
+}
+
+void gpu3d_raster_band_compose_complete(gpu_t *gpu, unsigned band)
+{
+    if (gpu != stream_gpu || band >= stream_bands) return;
+    if (band != 0u) compose_boundary_input(gpu, band - 1u, 2u);
+    if (band + 1u < stream_bands) compose_boundary_input(gpu, band, 1u);
+}
+
+int gpu3d_raster_band_compose_end(gpu_t *gpu)
+{
+    int composed = stream_gpu == gpu;
+    stream_gpu = 0;
+    return composed;
+}
+
+void gpu3d_raster_band_compose_block_pairs(gpu_t *machine)
+{
+    compose_block_pairs_range(machine, 0u, RECON_BANDS - 1u);
+}
+
+void gpu3d_raster_band_compose_worker(void *ctx)
+{
+    gpu3d_band_header_t *hdr = GPU3D_BAND_HEADER(ctx);
+    unsigned boundaries = RECON_BANDS - 1u;
+    unsigned first = boundaries * hdr->index / hdr->threads;
+    unsigned last = boundaries * (hdr->index + 1u) / hdr->threads;
+    compose_block_pairs_range(hdr->gpu, first, last);
 }

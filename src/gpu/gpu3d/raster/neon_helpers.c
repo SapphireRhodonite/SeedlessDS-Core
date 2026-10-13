@@ -1266,14 +1266,14 @@ void gpu3d_raster_rows_copy_gap_masked_alpha(const unsigned char *base, unsigned
         {
             const uint32x4_t vor = vdupq_n_u32(orval);
             while (n >= 4u) {
-                uint32_t m0 = mask[0], m1 = mask[1];
-                uint32_t m2 = mask[2], m3 = mask[3];
-                if ((m0 | m1 | m2 | m3) == 0u) {
+                uint32_t mask_word;
+                memcpy(&mask_word, mask, sizeof mask_word);
+                if (mask_word == 0u) {
                     mask += 4; src_a += 16; src_b += 16;
                     fa += 16; fb += 16; n -= 4u;
                     continue;
                 }
-                if (m0 && m1 && m2 && m3) {
+                if (((mask_word - 0x01010101u) & ~mask_word & 0x80808080u) == 0u) {
                     uint32x4_t vb = vorrq_u32(vld1q_u32((const uint32_t *)src_b), vor);
                     uint32x4_t va = vld1q_u32((const uint32_t *)src_a);
                     vst1q_u32((uint32_t *)fb, vb);
@@ -1596,44 +1596,53 @@ void gpu3d_raster_rows_copy_fixed_triple_512(uint32_t *d0, uint32_t *d1, unsigne
 #include <stdint.h>
 #include "hires_runtime.h"
 
+#ifdef __ARM_NEON
+static inline uint8x16_t fog_blend_rgba(uint8x16_t value, uint8x16_t color,
+                                     uint8x16_t factor)
+{
+    uint8x16_t gate = vreinterpretq_u8_s32(
+        vshrq_n_s32(vreinterpretq_s32_u8(value), 31));
+    value = vreinterpretq_u8_u32(vandq_u32(vreinterpretq_u32_u8(value),
+                                         vdupq_n_u32(0x7fffffffu)));
+    int8x16_t delta = vreinterpretq_s8_u8(vsubq_u8(value, color));
+    int8x16_t weight = vreinterpretq_s8_u8(vandq_u8(factor, gate));
+    int16x8_t low = vmull_s8(vget_low_s8(delta), vget_low_s8(weight));
+    int16x8_t high = vmull_high_s8(delta, weight);
+    uint8x16_t blend = vshrn_high_n_u16(
+        vshrn_n_u16(vreinterpretq_u16_s16(low), 7),
+        vreinterpretq_u16_s16(high), 7);
+    return vaddq_u8(value, blend);
+}
+#endif
+
 void gpu3d_raster_fog_blend_color_line_512(unsigned char *dst, const unsigned char *src,
                         const unsigned char *factor, uint32_t color) {
 
 #ifdef __ARM_NEON
-
-    {
-        uint8x16_t k0 = vdupq_n_u8((uint8_t)color);
-        uint8x16_t k1 = vdupq_n_u8((uint8_t)(color >> 8));
-        uint8x16_t k2 = vdupq_n_u8((uint8_t)(color >> 16));
-        uint8x16_t k3 = vdupq_n_u8((uint8_t)(color >> 24));
-        const uint8x16_t m7f = vdupq_n_u8(0x7f);
-        for (int base = 0; base < (int)RECON_3D_WIDTH; base += 16) {
-            uint8x16x4_t v = vld4q_u8(src + base * 4);
-            uint8x16_t f  = vld1q_u8(factor + base);
-            uint8x16_t eq = vceqq_u8(f, m7f);
-            uint8x16_t fn = vreinterpretq_u8_s8(vnegq_s8(vreinterpretq_s8_u8(f)));
-            uint8x16_t pu = vcgtq_u8(v.val[3], m7f);
-            fn = vaddq_u8(fn, eq);
-            v.val[3] = vandq_u8(v.val[3], m7f);
-            fn = vandq_u8(fn, pu);
-            int8x16_t fs = vreinterpretq_s8_u8(fn);
-            uint8x16_t d[4];
-            d[0] = vsubq_u8(v.val[0], k0);
-            d[1] = vsubq_u8(v.val[1], k1);
-            d[2] = vsubq_u8(v.val[2], k2);
-            d[3] = vsubq_u8(v.val[3], k3);
-            for (int q = 0; q < 4; q++) {
-                int8x16_t ds = vreinterpretq_s8_u8(d[q]);
-                uint16x8_t lo = vreinterpretq_u16_s16(
-                        vmull_s8(vget_low_s8(ds), vget_low_s8(fs)));
-                uint16x8_t hi = vreinterpretq_u16_s16(vmull_high_s8(ds, fs));
-                v.val[q] = vaddq_u8(v.val[q],
-                                    vshrn_high_n_u16(vshrn_n_u16(lo, 7), hi, 7));
-            }
-            vst4q_u8(dst + base * 4, v);
-        }
-        return;
+    const uint8x16_t packed_color = vreinterpretq_u8_u32(vdupq_n_u32(color));
+    for (int base = 0; base < (int)RECON_3D_WIDTH; base += 16) {
+        uint8x16_t rgba0 = vld1q_u8(src + base * 4);
+        uint8x16_t rgba1 = vld1q_u8(src + base * 4 + 16);
+        uint8x16_t rgba2 = vld1q_u8(src + base * 4 + 32);
+        uint8x16_t rgba3 = vld1q_u8(src + base * 4 + 48);
+        uint8x16_t f = vld1q_u8(factor + base);
+        uint8x16_t weights = vsubq_u8(vceqq_u8(f, vdupq_n_u8(0x7f)), f);
+        uint16x8_t low = vreinterpretq_u16_u8(vzip1q_u8(weights, weights));
+        uint16x8_t high = vreinterpretq_u16_u8(vzip2q_u8(weights, weights));
+        rgba0 = fog_blend_rgba(rgba0, packed_color,
+                             vreinterpretq_u8_u16(vzip1q_u16(low, low)));
+        rgba1 = fog_blend_rgba(rgba1, packed_color,
+                             vreinterpretq_u8_u16(vzip2q_u16(low, low)));
+        rgba2 = fog_blend_rgba(rgba2, packed_color,
+                             vreinterpretq_u8_u16(vzip1q_u16(high, high)));
+        rgba3 = fog_blend_rgba(rgba3, packed_color,
+                             vreinterpretq_u8_u16(vzip2q_u16(high, high)));
+        vst1q_u8(dst + base * 4, rgba0);
+        vst1q_u8(dst + base * 4 + 16, rgba1);
+        vst1q_u8(dst + base * 4 + 32, rgba2);
+        vst1q_u8(dst + base * 4 + 48, rgba3);
     }
+    return;
 #else
 
     uint8_t c[4];
@@ -1709,6 +1718,7 @@ void gpu3d_raster_fog_blend_color_split_parity(unsigned char *dst_pair, const un
             d[1] = vsubq_u8(v.val[1], k1);
             d[2] = vsubq_u8(v.val[2], k2);
             d[3] = vsubq_u8(v.val[3], k3);
+#pragma clang loop unroll(full)
             for (int q = 0; q < 4; q++) {
                 int8x16_t ds = vreinterpretq_s8_u8(d[q]);
                 uint16x8_t lo = vreinterpretq_u16_s16(
@@ -1890,12 +1900,15 @@ void gpu3d_raster_fog_blend_alpha_split_parity(unsigned char *dst, const unsigne
 void gpu3d_raster_palette_blit_deinterleave_512(unsigned char *dst, const unsigned char *src,
                          const unsigned char *idx, const unsigned char *pal) {
 
+#ifndef __ARM_NEON
     unsigned char t0[16], t1[16], t2[16];
     for (int i = 0; i < 8; i++) {
         t0[2 * i] = pal[i];      t0[2 * i + 1] = 0;
         t1[2 * i] = pal[8 + i];  t1[2 * i + 1] = 0;
         t2[2 * i] = pal[16 + i]; t2[2 * i + 1] = 0;
     }
+
+#endif
 
     unsigned char *dst_pair = dst;
 
@@ -1904,7 +1917,9 @@ void gpu3d_raster_palette_blit_deinterleave_512(unsigned char *dst, const unsign
 #ifdef __ARM_NEON
 
     {
-        const uint8x16_t T0 = vld1q_u8(t0), T1 = vld1q_u8(t1), T2 = vld1q_u8(t2);
+        const uint8x16_t T0 = vreinterpretq_u8_u16(vmovl_u8(vld1_u8(pal)));
+        const uint8x16_t T1 = vreinterpretq_u8_u16(vmovl_u8(vld1_u8(pal + 8)));
+        const uint8x16_t T2 = vreinterpretq_u8_u16(vmovl_u8(vld1_u8(pal + 16)));
         const uint8x16_t M1F = vdupq_n_u8(0x1f), ME0 = vdupq_n_u8(0xe0);
         unsigned char *dp = dst_pair, *di = dst_odd;
         for (unsigned base = 0; base < RECON_3D_WIDTH; base += 32u) {
@@ -1926,16 +1941,20 @@ void gpu3d_raster_palette_blit_deinterleave_512(unsigned char *dst, const unsign
             a1.val[3] = vorrq_u8(vandq_u8(a1.val[3], M1F), vandq_u8(h1, ME0));
 
             uint8x16x4_t pair, odd;
-            for (int c = 0; c < 4; c++) {
-                pair.val[c]   = vuzp1q_u8(a0.val[c], a1.val[c]);
-                odd.val[c] = vuzp2q_u8(a0.val[c], a1.val[c]);
-            }
+            pair.val[0] = vuzp1q_u8(a0.val[0], a1.val[0]);
+            odd.val[0] = vuzp2q_u8(a0.val[0], a1.val[0]);
+            pair.val[1] = vuzp1q_u8(a0.val[1], a1.val[1]);
+            odd.val[1] = vuzp2q_u8(a0.val[1], a1.val[1]);
+            pair.val[2] = vuzp1q_u8(a0.val[2], a1.val[2]);
+            odd.val[2] = vuzp2q_u8(a0.val[2], a1.val[2]);
+            pair.val[3] = vuzp1q_u8(a0.val[3], a1.val[3]);
+            odd.val[3] = vuzp2q_u8(a0.val[3], a1.val[3]);
             vst4q_u8(dp, pair);    dp += 64;
             vst4q_u8(di, odd);  di += 64;
         }
         return;
     }
-#endif
+#else
     for (int base = 0; base < (int)RECON_3D_WIDTH; base += 32) {
         unsigned char pix[128];
         memcpy(pix, src + (size_t)base * 4, 128);
@@ -1962,4 +1981,5 @@ void gpu3d_raster_palette_blit_deinterleave_512(unsigned char *dst, const unsign
         dst_pair += 64;
         dst_odd += 64;
     }
+#endif
 }

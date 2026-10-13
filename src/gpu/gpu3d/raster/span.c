@@ -1949,10 +1949,680 @@ static void clear_bit31(uint8_t *p)
         wr32(p + i, rd32(p + i) & 0x7fffffffu);
 }
 
+#ifdef __ARM_NEON
+static inline uint8x16_t modulate_packed_bytes(uint8x16_t fg,
+    uint8x8_t factor, uint16x8_t bias)
+{
+    uint16x8_t low = vmlal_u8(bias, vget_low_u8(fg), factor);
+    uint16x8_t high = vmlal_high_u8(bias, fg, vcombine_u8(factor, factor));
+    return vcombine_u8(vshrn_n_u16(low, 6), vshrn_n_u16(high, 6));
+}
+
+static inline uint8x16_t modulate_packed_words(uint8x16_t fg,
+    uint16x8_t factor, uint16x8_t bias)
+{
+    uint16x8_t low = vmlaq_u16(bias, vmovl_u8(vget_low_u8(fg)), factor);
+    uint16x8_t high = vmlaq_u16(bias, vmovl_high_u8(fg), factor);
+    return vcombine_u8(vshrn_n_u16(low, 6), vshrn_n_u16(high, 6));
+}
+
+static void modulate_constant_rgba(uint8_t *dst, uint32_t color, int32_t count)
+{
+    const uint8x8_t packed = vreinterpret_u8_u32(vdup_n_u32(color));
+    const int16x8_t shift = {0, 0, 0, 1, 0, 0, 0, 1};
+    const uint16x8_t values = vmovl_u8(packed);
+    const uint16x8_t bias = vshlq_u16(values, shift);
+    const uint16x8_t factor = vshlq_u16(vaddq_u16(values, vdupq_n_u16(1)), shift);
+    if ((uint8_t)color != 255u && (uint8_t)(color >> 8) != 255u &&
+        (uint8_t)(color >> 16) != 255u && (uint8_t)(color >> 24) <= 126u) {
+        const uint8x8_t small = vmovn_u16(factor);
+        do {
+            uint8x16_t f0 = vld1q_u8(dst), f1 = vld1q_u8(dst + 16);
+            uint8x16_t f2 = vld1q_u8(dst + 32), f3 = vld1q_u8(dst + 48);
+            uint8x16_t o0 = modulate_packed_bytes(f0, small, bias);
+            uint8x16_t o1 = modulate_packed_bytes(f1, small, bias);
+            uint8x16_t o2 = modulate_packed_bytes(f2, small, bias);
+            uint8x16_t o3 = modulate_packed_bytes(f3, small, bias);
+            vst1q_u8(dst, o0); vst1q_u8(dst + 16, o1);
+            vst1q_u8(dst + 32, o2); vst1q_u8(dst + 48, o3);
+            dst += 64;
+            count -= 16;
+        } while (count > 0);
+    } else {
+        do {
+            uint8x16_t f0 = vld1q_u8(dst), f1 = vld1q_u8(dst + 16);
+            uint8x16_t f2 = vld1q_u8(dst + 32), f3 = vld1q_u8(dst + 48);
+            uint8x16_t o0 = modulate_packed_words(f0, factor, bias);
+            uint8x16_t o1 = modulate_packed_words(f1, factor, bias);
+            uint8x16_t o2 = modulate_packed_words(f2, factor, bias);
+            uint8x16_t o3 = modulate_packed_words(f3, factor, bias);
+            vst1q_u8(dst, o0); vst1q_u8(dst + 16, o1);
+            vst1q_u8(dst + 32, o2); vst1q_u8(dst + 48, o3);
+            dst += 64;
+            count -= 16;
+        } while (count > 0);
+    }
+}
+
+static __attribute__((noinline)) void shade_visible_texture_runs(
+    const uint8_t *config, const gpu3d_t *gpu3d, const gpu3d_polygon_t *order,
+    uint8_t *rgba, uint8_t *planes, uint32_t stride, uint32_t alpha,
+    uint32_t count, const uint8_t *mask, uint32_t flags)
+{
+    const gpu3d_texture_entry_t *texture = order->texture;
+    const uint32_t mode = order->polygon_attr & 0x30u;
+    const int constant = (flags & 4u) != 0 && (mode == 0u || mode == 0x30u);
+    uint32_t color = 0;
+    if (constant)
+        color = (uint32_t)planes[0] | ((uint32_t)planes[stride] << 8)
+              | ((uint32_t)planes[(uint64_t)stride * 2u] << 16) | (alpha << 24);
+    uint32_t first = 0;
+    while (first < count) {
+        while (first + 16u <= count && vmaxvq_u8(vld1q_u8(mask + first)) == 0) {
+            memset(rgba + (uint64_t)first * 4u, 0, 64);
+            first += 16u;
+        }
+        if (first == count)
+            break;
+        uint32_t end = first + 16u;
+        while (end + 16u <= count && vmaxvq_u8(vld1q_u8(mask + end)) != 0)
+            end += 16u;
+        if (end + 16u > count)
+            end = count;
+        uint32_t length = end - first;
+        uint8_t *pixels = rgba + (uint64_t)first * 4u;
+        gpu3d_raster_texture_wrap_dispatch((uint8_t *)order, (uint32_t *)pixels,
+            (const int16_t *)pixels, (int32_t)length, mask + first);
+        if (texture->palette_count != 0)
+            gpu3d_raster_texel_table_lookup_chained((uint32_t *)pixels,
+                (const uint32_t *)pixels, texture->data,
+                (const uint32_t *)texture->palette, length);
+        else
+            gpu3d_raster_texel_table_lookup((uint32_t *)pixels,
+                (const uint32_t *)pixels, (const uint32_t *)texture->data, (int32_t)length);
+        if (constant)
+            modulate_constant_rgba(pixels, color, (int32_t)length);
+        else
+            gpu3d_raster_texel_blend_dispatch(config, gpu3d, order, pixels, pixels,
+                planes + first, stride, alpha, length);
+        first = end;
+    }
+}
+
+#endif
+
+#ifdef __ARM_NEON
+static int texture_rows_are_complete(const uint8_t *tables, uint32_t row_count,
+                                     uint32_t pixel_count)
+{
+    if (row_count == 0 || pixel_count == 0)
+        return 0;
+    const uint8_t *lengths = tables + 9u * RECON_3D_ROW_ARRAY;
+    uint32_t total = 0;
+    for (uint32_t row = 0; row < row_count; ++row) {
+        uint16_t length = rd16(lengths + (size_t)row * 4u);
+        if (length == 0)
+            return 0;
+        total += length;
+    }
+    return total == pixel_count;
+}
+
+static __attribute__((noinline)) void interpolate_texture_rows(int16_t *dst,
+    const uint8_t *tables, const int16_t *coefficients, uint32_t row_count,
+    uint32_t pixel_count)
+{
+    const uint8_t *starts = tables + 4u * RECON_3D_ROW_ARRAY;
+    const uint8_t *steps = tables + 5u * RECON_3D_ROW_ARRAY;
+    const uint8_t *lengths = tables + 9u * RECON_3D_ROW_ARRAY;
+    uint32_t remaining = pixel_count;
+    for (uint32_t row = 0; row < row_count; ++row) {
+        uint32_t start = rd32(starts), step = rd32(steps);
+        int16_t step_x = (int16_t)step, step_y = (int16_t)(step >> 16);
+        int32_t base_x = (int32_t)(int16_t)start * 32768 + (step_x > 0 ? 1024 : 0);
+        int32_t base_y = (int32_t)(int16_t)(start >> 16) * 32768 + (step_y > 0 ? 1024 : 0);
+        const int32x4_t x = vdupq_n_s32(base_x), y = vdupq_n_s32(base_y);
+        int32_t left = rd16(lengths);
+        while (left > 0 && remaining >= 8) {
+            int16x8_t values = vld1q_s16(coefficients);
+            int32x4_t x0 = vmlal_n_s16(x, vget_low_s16(values), step_x);
+            int32x4_t x1 = vmlal_high_n_s16(x, values, step_x);
+            int32x4_t y0 = vmlal_n_s16(y, vget_low_s16(values), step_y);
+            int32x4_t y1 = vmlal_high_n_s16(y, values, step_y);
+            int16x8x2_t output;
+            output.val[0] = vshrq_n_s16(vcombine_s16(vshrn_n_s32(x0, 16), vshrn_n_s32(x1, 16)), 3);
+            output.val[1] = vshrq_n_s16(vcombine_s16(vshrn_n_s32(y0, 16), vshrn_n_s32(y1, 16)), 3);
+            vst2q_s16(dst, output);
+            dst += 16;
+            coefficients += 8;
+            left -= 8;
+            remaining -= 8;
+        }
+        if (left < 0) {
+            dst += left * 2;
+            coefficients += left;
+            remaining -= left;
+            left = 0;
+        }
+        while (left-- > 0) {
+            int32_t value = *coefficients++;
+            *dst++ = (int16_t)((int32_t)((uint32_t)base_x + (uint32_t)(step_x * value)) >> 19);
+            *dst++ = (int16_t)((int32_t)((uint32_t)base_y + (uint32_t)(step_y * value)) >> 19);
+            --remaining;
+        }
+        starts += 4;
+        steps += 4;
+        lengths += 4;
+    }
+    uint32_t padding = (16u - (pixel_count & 15u)) & 15u;
+    memset(dst, 0, (size_t)padding * 4u);
+}
+
+static __attribute__((noinline)) void interpolate_color_texture_rows(uint8_t *dst, const uint8_t *tables,
+                          const int16_t *coef, uint32_t row_count,
+                          uint32_t pixel_count, uint32_t stride, const uint8_t *masks)
+{
+    int16_t *uv = (int16_t *)(dst + stride * 3u);
+    uint8_t *red = dst;
+    uint8_t *green = dst + stride;
+    uint8_t *blue = dst + stride * 2u;
+    const uint32_t row_array = RECON_3D_ROW_ARRAY;
+    uint32_t remaining = pixel_count;
+    for (uint32_t row = 0; row < row_count; row++) {
+        uint32_t start_rg, start_b, step_rg, step_b;
+        uint32_t start_uv = rd32(tables + 4u * row_array);
+        uint32_t step_uv = rd32(tables + 5u * row_array);
+        int16_t step_u = (int16_t)step_uv, step_v = (int16_t)(step_uv >> 16);
+        int32_t base_u = (int32_t)(int16_t)start_uv * 32768 + (step_u > 0 ? 1024 : 0);
+        int32_t base_v = (int32_t)(int16_t)(start_uv >> 16) * 32768 + (step_v > 0 ? 1024 : 0);
+        const int32x4_t u = vdupq_n_s32(base_u), v = vdupq_n_s32(base_v);
+        memcpy(&start_rg, tables + 6u * row_array, 4);
+        memcpy(&start_b, tables + 8u * row_array, 4);
+        memcpy(&step_rg, tables + 7u * row_array, 4);
+        memcpy(&step_b, tables + 9u * row_array, 4);
+        tables += 4;
+        uint32_t base_r = (start_rg & 0xffffu) << 15;
+        uint32_t base_g = (start_rg >> 16) << 15;
+        uint32_t base_b = (start_b >> 16) << 15;
+        int16_t step_r = (int16_t)step_rg;
+        int16_t step_g = (int16_t)(step_rg >> 16);
+        int16_t step_blue = (int16_t)(step_b >> 16);
+        int32_t left = step_b & 0xffffu;
+        int32x4_t r = vdupq_n_s32((int32_t)base_r);
+        int32x4_t g = vdupq_n_s32((int32_t)base_g);
+        int32x4_t b = vdupq_n_s32((int32_t)base_b);
+        while (left > 0 && remaining >= 8) {
+            if (left >= 8 && rd64(masks) == 0) {
+                vst1_u8(red, vdup_n_u8(0));
+                vst1_u8(green, vdup_n_u8(0));
+                vst1_u8(blue, vdup_n_u8(0));
+                vst1q_s16(uv, vdupq_n_s16(0));
+                vst1q_s16(uv + 8, vdupq_n_s16(0));
+            } else {
+                int16x8_t c = vld1q_s16(coef);
+                int32x4_t r0 = vmlal_n_s16(r, vget_low_s16(c), step_r);
+                int32x4_t r1 = vmlal_high_n_s16(r, c, step_r);
+                int32x4_t g0 = vmlal_n_s16(g, vget_low_s16(c), step_g);
+                int32x4_t g1 = vmlal_high_n_s16(g, c, step_g);
+                int32x4_t b0 = vmlal_n_s16(b, vget_low_s16(c), step_blue);
+                int32x4_t b1 = vmlal_high_n_s16(b, c, step_blue);
+                uint16x8_t rv = vcombine_u16(vshrn_n_u32(vreinterpretq_u32_s32(r0), 16),
+                                             vshrn_n_u32(vreinterpretq_u32_s32(r1), 16));
+                uint16x8_t gv = vcombine_u16(vshrn_n_u32(vreinterpretq_u32_s32(g0), 16),
+                                             vshrn_n_u32(vreinterpretq_u32_s32(g1), 16));
+                uint16x8_t bv = vcombine_u16(vshrn_n_u32(vreinterpretq_u32_s32(b0), 16),
+                                             vshrn_n_u32(vreinterpretq_u32_s32(b1), 16));
+                vst1_u8(red, vshrn_n_u16(rv, 2));
+                vst1_u8(green, vshrn_n_u16(gv, 2));
+                vst1_u8(blue, vshrn_n_u16(bv, 2));
+                int32x4_t u0 = vmlal_n_s16(u, vget_low_s16(c), step_u);
+                int32x4_t u1 = vmlal_high_n_s16(u, c, step_u);
+                int32x4_t v0 = vmlal_n_s16(v, vget_low_s16(c), step_v);
+                int32x4_t v1 = vmlal_high_n_s16(v, c, step_v);
+                int16x8x2_t coords;
+                coords.val[0] = vshrq_n_s16(vcombine_s16(vshrn_n_s32(u0, 16), vshrn_n_s32(u1, 16)), 3);
+                coords.val[1] = vshrq_n_s16(vcombine_s16(vshrn_n_s32(v0, 16), vshrn_n_s32(v1, 16)), 3);
+                vst2q_s16(uv, coords);
+            }
+            uv += 16;
+            red += 8;
+            green += 8;
+            blue += 8;
+            coef += 8;
+            masks += 8;
+            left -= 8;
+            remaining -= 8;
+        }
+        if (left < 0) {
+            uv += left * 2;
+            red += left;
+            green += left;
+            blue += left;
+            coef += left;
+            masks += left;
+            remaining -= left;
+            left = 0;
+        }
+#if defined(__clang__)
+#pragma clang loop vectorize(disable) interleave(disable)
+#endif
+        while (left--) {
+            int32_t c = *coef++;
+            masks++;
+            *red++ = (uint8_t)((base_r + (uint32_t)(step_r * c)) >> 18);
+            *green++ = (uint8_t)((base_g + (uint32_t)(step_g * c)) >> 18);
+            *blue++ = (uint8_t)((base_b + (uint32_t)(step_blue * c)) >> 18);
+            *uv++ = (int16_t)((int32_t)((uint32_t)base_u + (uint32_t)(step_u * c)) >> 19);
+            *uv++ = (int16_t)((int32_t)((uint32_t)base_v + (uint32_t)(step_v * c)) >> 19);
+            remaining--;
+        }
+    }
+    uint32_t padding = (16u - (pixel_count & 15u)) & 15u;
+    if (padding >= 8u) {
+        memset(red, 0, 8); memset(green, 0, 8); memset(blue, 0, 8);
+        red += 8; green += 8; blue += 8; padding -= 8;
+    }
+    if (padding >= 4u) {
+        memset(red, 0, 4); memset(green, 0, 4); memset(blue, 0, 4);
+        red += 4; green += 4; blue += 4; padding -= 4;
+    }
+    if (padding >= 2u) {
+        memset(red, 0, 2); memset(green, 0, 2); memset(blue, 0, 2);
+        red += 2; green += 2; blue += 2; padding -= 2;
+    }
+    if (padding != 0u) {
+        *red = 0; *green = 0; *blue = 0;
+    }
+    padding = (16u - (pixel_count & 15u)) & 15u;
+    if (padding >= 8u) {
+        vst1q_s16(uv, vdupq_n_s16(0));
+        vst1q_s16(uv + 8, vdupq_n_s16(0));
+        uv += 16; padding -= 8;
+    }
+    if (padding >= 4u) {
+        vst1q_s16(uv, vdupq_n_s16(0));
+        uv += 8; padding -= 4;
+    }
+    if (padding >= 2u) {
+        vst1_s16(uv, vdup_n_s16(0));
+        uv += 4; padding -= 2;
+    }
+    if (padding != 0u)
+        memset(uv, 0, 4);
+}
+#endif
+
+#ifdef __ARM_NEON
+static __attribute__((noinline)) int span_depth_bounds_reject
+    (const uint8_t *state, const uint8_t *entry, uint32_t column,
+     uint32_t width, uint32_t rows)
+{
+    if (width == 0 || width > RECON_BAND_ROWS || column > RECON_BAND_ROWS - width
+        || rows == 0 || rows > RECON_3D_WIDTH)
+        return 0;
+    const uint8_t *pixels = state + (uint64_t)column * RECON_ROW_STEP + RECON_3D_PLANE;
+    for (uint32_t row = 0; row < width; ++row) {
+        uint32_t length = rd16(entry + 9u * RECON_3D_ROW_ARRAY);
+        uint32_t index = rd16(entry + 8u * RECON_3D_ROW_ARRAY);
+        if (length == 0 || length > rows || length > RECON_3D_WIDTH
+            || index > RECON_3D_WIDTH - length)
+            return 0;
+        uint32_t base = rd32(entry);
+        int32_t factor = (int32_t)rd32(entry + RECON_3D_ROW_ARRAY);
+        uint32_t magnitude = factor < 0 ? (uint32_t)(-(int64_t)factor) : (uint32_t)factor;
+        uint32_t minimum = base;
+        if (factor <= 0 || length > 2048u || base > (uint32_t)INT32_MAX - (uint32_t)factor) {
+            if (magnitude > base || magnitude > UINT32_MAX - base)
+                return 0;
+            minimum = base - magnitude;
+        }
+        if (minimum < 0x00ffffffu) {
+            const uint32_t *depth = (const uint32_t *)(pixels + (uint64_t)index * 4u);
+            if ((depth[0] & 0x00ffffffu) > minimum)
+                return 0;
+            uint32_t left = length;
+            while (left >= 16u) {
+                uint32x4_t a = vshlq_n_u32(vld1q_u32(depth), 8);
+                uint32x4_t b = vshlq_n_u32(vld1q_u32(depth + 4), 8);
+                uint32x4_t c = vshlq_n_u32(vld1q_u32(depth + 8), 8);
+                uint32x4_t d = vshlq_n_u32(vld1q_u32(depth + 12), 8);
+                uint32x4_t maximum = vmaxq_u32(vmaxq_u32(a, b), vmaxq_u32(c, d));
+                if (vmaxvq_u32(maximum) > (minimum << 8))
+                    return 0;
+                depth += 16;
+                left -= 16;
+            }
+            while (left != 0) {
+                if ((*depth++ & 0x00ffffffu) > minimum)
+                    return 0;
+                --left;
+            }
+        }
+        rows -= length;
+        pixels += RECON_ROW_STEP;
+        entry += 4;
+    }
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return rows == 0 && fpcr == 0;
+}
+#endif
+
+#ifdef __ARM_NEON
+static inline uint8x16_t blend_span_channel(uint8x16_t source, uint8x16_t previous,
+                                           uint8x16_t source_weight, uint8x16_t previous_weight)
+{
+    uint16x8_t low = vmovl_u8(vget_low_u8(source));
+    uint16x8_t high = vmovl_high_u8(source);
+    low = vmlal_u8(low, vget_low_u8(source), vget_low_u8(source_weight));
+    low = vmlal_u8(low, vget_low_u8(previous), vget_low_u8(previous_weight));
+    high = vmlal_high_u8(high, source, source_weight);
+    high = vmlal_high_u8(high, previous, previous_weight);
+    return vshrn_high_n_u16(vshrn_n_u16(low, 5), high, 5);
+}
+
+static __attribute__((noinline)) void blend_translucent_span(uint8_t *zone, uint32_t stride,
+    uint32_t count, uint32_t layer_id, uint32_t selector)
+{
+    uint8_t *color = zone + (uint64_t)stride * 6u;
+    uint8_t *depth = zone + (uint64_t)stride * 12u;
+    const uint8_t *previous_color = zone + (uint64_t)stride * 14u;
+    const uint8_t *previous_depth = zone + stride;
+    uint8_t *alpha = zone + (uint64_t)stride * 3u;
+    uint8_t *mask = zone + (uint64_t)stride * 16u;
+    uint8_t *layer = zone + (uint64_t)stride * 17u;
+    const uint32_t rounded = (count + 15u) & ~15u;
+    const uint8x16_t maximum_alpha = vdupq_n_u8(31);
+    const uint8x16_t id = vdupq_n_u8((uint8_t)layer_id);
+    const uint8x16_t fog = vdupq_n_u8((selector & 0x8000u) ? 0x80 : 0);
+    for (uint32_t i = 0; i < rounded; i += 16) {
+        uint8x16x4_t source = vld4q_u8(color + (uint64_t)i * 4u);
+        uint8x16x4_t previous = vld4q_u8(previous_color + (uint64_t)i * 4u);
+        uint8x16_t original_alpha = source.val[3];
+        uint8x16_t previous_alpha = vandq_u8(previous.val[3], maximum_alpha);
+        uint8x16_t zero = vceqzq_u8(previous_alpha);
+        uint8x16_t source_weight = vbslq_u8(zero, maximum_alpha, original_alpha);
+        uint8x16_t previous_weight = vbicq_u8(vsubq_u8(maximum_alpha, original_alpha), zero);
+        source.val[0] = blend_span_channel(source.val[0], previous.val[0], source_weight, previous_weight);
+        source.val[1] = blend_span_channel(source.val[1], previous.val[1], source_weight, previous_weight);
+        source.val[2] = blend_span_channel(source.val[2], previous.val[2], source_weight, previous_weight);
+        source.val[3] = vorrq_u8(vmaxq_u8(original_alpha, previous_alpha), fog);
+        uint8x16_t opaque = vceqq_u8(original_alpha, maximum_alpha);
+        uint8x16_t old_layer = vld1q_u8(layer + i);
+        uint8x16_t same_layer = vceqq_u8(old_layer, id);
+        uint8x16_t active = vbicq_u8(vld1q_u8(mask + i), vbicq_u8(same_layer, opaque));
+        uint8x16_t both = vandq_u8(active, opaque);
+        uint8x16_t keep = vbicq_u8(active, opaque);
+        uint8x16_t alpha_mask = vandq_u8(active, vornq_u8(opaque, fog));
+        source.val[0] = vbslq_u8(active, source.val[0], previous.val[0]);
+        source.val[1] = vbslq_u8(active, source.val[1], previous.val[1]);
+        source.val[2] = vbslq_u8(active, source.val[2], previous.val[2]);
+        source.val[3] = vbslq_u8(alpha_mask, source.val[3], previous.val[3]);
+        uint8x16x4_t current_depth = vld4q_u8(depth + (uint64_t)i * 4u);
+        uint8x16x4_t old_depth = vld4q_u8(previous_depth + (uint64_t)i * 4u);
+        uint8x16_t depth_mask = (selector & 0x800u) ? active : both;
+        current_depth.val[0] = vbslq_u8(depth_mask, current_depth.val[0], old_depth.val[0]);
+        current_depth.val[1] = vbslq_u8(depth_mask, current_depth.val[1], old_depth.val[1]);
+        current_depth.val[2] = vbslq_u8(depth_mask, current_depth.val[2], old_depth.val[2]);
+        current_depth.val[3] = vbslq_u8(both, vorrq_u8(current_depth.val[3], id), old_depth.val[3]);
+        vst1q_u8(alpha + i, original_alpha);
+        vst1q_u8(mask + i, active);
+        vst4q_u8(color + (uint64_t)i * 4u, source);
+        vst1q_u8(layer + i, vbslq_u8(keep, id, old_layer));
+        vst4q_u8(depth + (uint64_t)i * 4u, current_depth);
+    }
+    if (rounded & 16u) {
+        uint8x16_t opaque = vceqq_u8(vld1q_u8(alpha + rounded), maximum_alpha);
+        uint8x16_t same_layer = vceqq_u8(vld1q_u8(layer + rounded), id);
+        uint8x16_t active = vbicq_u8(vld1q_u8(mask + rounded), vbicq_u8(same_layer, opaque));
+        vst1q_u8(mask + rounded, active);
+    }
+}
+#endif
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+
+static inline void store_perspective_values(int16_t *dst, int16x8_t value, unsigned count)
+{
+    if (count == 8u) {
+        vst1q_s16(dst, value);
+        return;
+    }
+    if (count >= 4u) {
+        vst1_s16(dst, vget_low_s16(value));
+        dst += 4;
+        count -= 4;
+        value = vextq_s16(value, value, 4);
+    }
+    uint64_t bits = vget_lane_u64(vreinterpret_u64_s16(vget_low_s16(value)), 0);
+    if (count >= 2u) {
+        uint32_t pair = (uint32_t)bits;
+        memcpy(dst, &pair, sizeof pair);
+        dst += 2;
+        count -= 2;
+        bits >>= 32;
+    }
+    if (count != 0u) {
+        uint16_t one = (uint16_t)bits;
+        memcpy(dst, &one, sizeof one);
+    }
+}
+
+static inline void divide_perspective_depth_vectors(int16_t *dst, int32_t *depth,
+    int32x4_t factor, int32x4_t offset, int refine_twice,
+    float32x4_t n0, float32x4_t n1, float32x4_t n2, float32x4_t n3,
+    float32x4_t b0, float32x4_t b1, float32x4_t b2, float32x4_t b3)
+{
+    float32x4_t r0 = vrecpeq_f32(b0);
+    float32x4_t r1 = vrecpeq_f32(b1);
+    float32x4_t r2 = vrecpeq_f32(b2);
+    float32x4_t r3 = vrecpeq_f32(b3);
+    r0 = vmulq_f32(r0, vrecpsq_f32(r0, b0));
+    r1 = vmulq_f32(r1, vrecpsq_f32(r1, b1));
+    r2 = vmulq_f32(r2, vrecpsq_f32(r2, b2));
+    r3 = vmulq_f32(r3, vrecpsq_f32(r3, b3));
+    if (refine_twice) {
+        r0 = vmulq_f32(r0, vrecpsq_f32(r0, b0));
+        r1 = vmulq_f32(r1, vrecpsq_f32(r1, b1));
+        r2 = vmulq_f32(r2, vrecpsq_f32(r2, b2));
+        r3 = vmulq_f32(r3, vrecpsq_f32(r3, b3));
+    }
+    int32x4_t f0 = vcvtq_n_s32_f32(vmulq_f32(n0, r0), 15);
+    int32x4_t f1 = vcvtq_n_s32_f32(vmulq_f32(n1, r1), 15);
+    int32x4_t f2 = vcvtq_n_s32_f32(vmulq_f32(n2, r2), 15);
+    int32x4_t f3 = vcvtq_n_s32_f32(vmulq_f32(n3, r3), 15);
+    vst1q_s16(dst, vcombine_s16(vmovn_s32(f0), vmovn_s32(f1)));
+    vst1q_s16(dst + 8, vcombine_s16(vmovn_s32(f2), vmovn_s32(f3)));
+    vst1q_s32(depth, vaddq_s32(vqdmulhq_s32(vshlq_n_s32(f0, 16), factor), offset));
+    vst1q_s32(depth + 4, vaddq_s32(vqdmulhq_s32(vshlq_n_s32(f1, 16), factor), offset));
+    vst1q_s32(depth + 8, vaddq_s32(vqdmulhq_s32(vshlq_n_s32(f2, 16), factor), offset));
+    vst1q_s32(depth + 12, vaddq_s32(vqdmulhq_s32(vshlq_n_s32(f3, 16), factor), offset));
+}
+
+static inline void divide_perspective_partial(int16_t *dst,
+    float32x4_t n0, float32x4_t n1, float32x4_t b0, float32x4_t b1,
+    unsigned count)
+{
+    if (count < 8u) {
+        const uint32x4_t lanes0 = {0, 1, 2, 3}, lanes1 = {4, 5, 6, 7};
+        uint32x4_t limit = vdupq_n_u32(count);
+        uint32x4_t valid0 = vcltq_u32(lanes0, limit), valid1 = vcltq_u32(lanes1, limit);
+        float32x4_t safe_n = vdupq_lane_f32(vget_low_f32(n0), 0);
+        float32x4_t safe_b = vdupq_lane_f32(vget_low_f32(b0), 0);
+        n0 = vbslq_f32(valid0, n0, safe_n);
+        n1 = vbslq_f32(valid1, n1, safe_n);
+        b0 = vbslq_f32(valid0, b0, safe_b);
+        b1 = vbslq_f32(valid1, b1, safe_b);
+    }
+    float32x4_t r0 = vrecpeq_f32(b0), r1 = vrecpeq_f32(b1);
+    r0 = vmulq_f32(r0, vrecpsq_f32(r0, b0));
+    r1 = vmulq_f32(r1, vrecpsq_f32(r1, b1));
+    r0 = vmulq_f32(r0, vrecpsq_f32(r0, b0));
+    r1 = vmulq_f32(r1, vrecpsq_f32(r1, b1));
+    int32x4_t f0 = vcvtq_n_s32_f32(vmulq_f32(n0, r0), 15);
+    int32x4_t f1 = vcvtq_n_s32_f32(vmulq_f32(n1, r1), 15);
+    store_perspective_values(dst, vcombine_s16(vmovn_s32(f0), vmovn_s32(f1)), count);
+}
+#endif
+
+#ifdef __ARM_NEON
+static inline void store_depth_values(int32_t *dst, int32x4_t low,
+    int32x4_t high, unsigned count)
+{
+    if (count == 8u) {
+        vst1q_s32(dst, low);
+        vst1q_s32(dst + 4, high);
+        return;
+    }
+    if (count >= 4u) {
+        vst1q_s32(dst, low);
+        dst += 4;
+        count -= 4u;
+        low = high;
+    }
+    if (count >= 2u) {
+        vst1_s32(dst, vget_low_s32(low));
+        dst += 2;
+        count -= 2u;
+        low = vextq_s32(low, low, 2);
+    }
+    if (count != 0u)
+        vst1q_lane_s32(dst, low, 0);
+}
+
+static __attribute__((noinline)) int generate_perspective_depth_rows(uint8_t *zone,
+    const uint8_t *tables, uint32_t row_count, uint32_t count, uint32_t stride)
+{
+    uint64_t control, status;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(control));
+    __asm__ volatile("mrs %0, fpsr" : "=r"(status));
+    int bounded = control == 0u && (status & 16u) != 0u;
+    uint64_t total = 0;
+    for (uint32_t row = 0; row < row_count; row++) {
+        int32_t left, delta;
+        uint16_t length;
+        memcpy(&left, tables + row * 4u, sizeof left);
+        memcpy(&delta, tables + RECON_3D_ROW_ARRAY + row * 4u, sizeof delta);
+        memcpy(&length, tables + 9u * RECON_3D_ROW_ARRAY + row * 4u, sizeof length);
+        if (length == 0u || delta == INT32_MIN)
+            return 0;
+        int64_t sum = (int64_t)left + delta;
+        bounded &= length <= 2048u && left >= 0 && sum > 0
+            && sum <= INT32_MAX && left <= 2 * sum;
+        total += length;
+    }
+    if (total != count || total == 0u)
+        return 0;
+    int32_t *depth = (int32_t *)(zone + (uint64_t)stride * 12u);
+    float *numer = (float *)zone;
+    float *denom = (float *)(zone + (uint64_t)stride * 8u);
+    int16_t *output = (int16_t *)zone;
+    const float32x4_t positions0 = {0.0f, 1.0f, 2.0f, 3.0f};
+    const float32x4_t positions1 = {4.0f, 5.0f, 6.0f, 7.0f};
+    uint32_t cursor = 0;
+    for (uint32_t row = 0; row < row_count; row++) {
+        int32_t left, delta;
+        uint16_t length;
+        memcpy(&left, tables + row * 4u, sizeof left);
+        memcpy(&delta, tables + RECON_3D_ROW_ARRAY + row * 4u, sizeof delta);
+        memcpy(&length, tables + 9u * RECON_3D_ROW_ARRAY + row * 4u, sizeof length);
+        int32_t sum = (int32_t)((uint32_t)left + (uint32_t)delta);
+        float start = (float)sum * (float)length;
+        float first = (float)left, change = (float)delta;
+        float32x4_t d0 = vfmsq_f32(vdupq_n_f32(start), positions0, vdupq_n_f32(change));
+        float32x4_t d1 = vfmsq_f32(vdupq_n_f32(start), positions1, vdupq_n_f32(change));
+        float32x4_t a0 = vmulq_n_f32(positions0, first);
+        float32x4_t a1 = vmulq_n_f32(positions1, first);
+        float32x4_t step_n = vdupq_n_f32(8.0f * first), step_d = vdupq_n_f32(8.0f * change);
+        const int32x4_t depth_factor = vdupq_n_s32(delta);
+        const int32x4_t depth_offset = vdupq_n_s32(left);
+        uint32_t offset = 0;
+        while ((uint32_t)length - offset >= 16u) {
+            float32x4_t a2 = vaddq_f32(a0, step_n), a3 = vaddq_f32(a1, step_n);
+            float32x4_t d2 = vsubq_f32(d0, step_d), d3 = vsubq_f32(d1, step_d);
+            vst1q_f32(numer + cursor + offset, a0);
+            vst1q_f32(numer + cursor + offset + 4u, a1);
+            vst1q_f32(numer + cursor + offset + 8u, a2);
+            vst1q_f32(numer + cursor + offset + 12u, a3);
+            vst1q_f32(denom + cursor + offset, d0);
+            vst1q_f32(denom + cursor + offset + 4u, d1);
+            vst1q_f32(denom + cursor + offset + 8u, d2);
+            vst1q_f32(denom + cursor + offset + 12u, d3);
+            divide_perspective_depth_vectors(output + cursor + offset,
+                depth + cursor + offset, depth_factor, depth_offset, !bounded,
+                a0, a1, a2, a3, d0, d1, d2, d3);
+            a0 = vaddq_f32(a2, step_n); a1 = vaddq_f32(a3, step_n);
+            d0 = vsubq_f32(d2, step_d); d1 = vsubq_f32(d3, step_d);
+            offset += 16u;
+        }
+        if (offset != length || length == 0u) {
+            do {
+                unsigned valid = (uint32_t)length - offset;
+                if (valid > 8u) valid = 8u;
+                vst1q_f32(numer + cursor + offset, a0);
+                vst1q_f32(numer + cursor + offset + 4u, a1);
+                vst1q_f32(denom + cursor + offset, d0);
+                vst1q_f32(denom + cursor + offset + 4u, d1);
+                if (valid != 0u)
+                    divide_perspective_partial(output + cursor + offset, a0, a1, d0, d1, valid);
+                a0 = vaddq_f32(a0, step_n); a1 = vaddq_f32(a1, step_n);
+                d0 = vsubq_f32(d0, step_d); d1 = vsubq_f32(d1, step_d);
+                offset += 8u;
+            } while (offset < length);
+        }
+        cursor += length;
+    }
+    uint32_t padded = (count + 15u) & ~15u;
+    for (uint32_t i = count; i < padded;) {
+        unsigned valid = padded - i;
+        if (valid > 4u) valid = 4u;
+        float32x4_t a = vdupq_n_f32(0.0f), b = vdupq_n_f32(1.0f);
+        if (valid == 4u) {
+            a = vld1q_f32(numer + i); b = vld1q_f32(denom + i);
+        } else {
+            a = vld1q_lane_f32(numer + i, a, 0); b = vld1q_lane_f32(denom + i, b, 0);
+            if (valid > 1u) { a = vld1q_lane_f32(numer + i + 1u, a, 1); b = vld1q_lane_f32(denom + i + 1u, b, 1); }
+            if (valid > 2u) { a = vld1q_lane_f32(numer + i + 2u, a, 2); b = vld1q_lane_f32(denom + i + 2u, b, 2); }
+        }
+        divide_perspective_partial(output + i, a, vdupq_n_f32(0.0f), b, vdupq_n_f32(1.0f), valid);
+        i += valid;
+    }
+    cursor = 0;
+    for (uint32_t row = 0; row < row_count; row++) {
+        int32_t left, delta;
+        uint16_t length;
+        memcpy(&left, tables + row * 4u, sizeof left);
+        memcpy(&delta, tables + RECON_3D_ROW_ARRAY + row * 4u, sizeof delta);
+        memcpy(&length, tables + 9u * RECON_3D_ROW_ARRAY + row * 4u, sizeof length);
+        uint32_t limit = (row + 1u == row_count) ? ((length + 7u) & ~7u) : length;
+        const int32x4_t factor = vdupq_n_s32(delta), offset = vdupq_n_s32(left);
+        for (uint32_t i = length & ~15u; i < limit; i += 8u) {
+            unsigned valid = limit - i;
+            if (valid > 8u) valid = 8u;
+            int16x8_t values = vld1q_s16(output + cursor + i);
+            int32x4_t low = vshll_n_s16(vget_low_s16(values), 16);
+            int32x4_t high = vshll_high_n_s16(values, 16);
+            store_depth_values(depth + cursor + i,
+                vaddq_s32(vqdmulhq_s32(low, factor), offset),
+                vaddq_s32(vqdmulhq_s32(high, factor), offset), valid);
+        }
+        cursor += length;
+    }
+    return 1;
+}
+#endif
+
 void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entry, const gpu3d_polygon_t *order,
                          uint32_t column, uint32_t width, uint8_t *zone,
                          uint32_t rows, uint32_t flags, const gpu3d_bank_vertex_t *extra)
 {
+#ifdef __ARM_NEON
+    if ((flags & 0x39u) == 8u && (order->polygon_attr & 0x4000u) == 0
+        && (order->polygon_attr & 0x30u) != 0x30u
+        && span_depth_bounds_reject(state, entry, column, width, rows))
+        return;
+#endif
 
     uint32_t aligned = (rows * 2u + 0x1du) & 0xfffffff0u;
     if (recon_scale_3d > 2u && rows < aligned)
@@ -1970,12 +2640,19 @@ void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entr
     gpu_t *root = hdr->gpu;
     uint8_t *root_secondary = (uint8_t *)hdr->gpu3d;
 
+    int depth_ready = 0;
     if ((flags & 0x20u) == 0) {
-        uint8_t *end = zone + (uint64_t)(aligned * 2u) * 4u;
-        gpu3d_raster_row_ramp_generate
-            ((int *)(entry), (float *)(zone), (float *)(end), width);
-        gpu3d_raster_perspective_divide_fix15
-            ((int16_t *)(zone), (const float *)(zone), (const float *)(end), rows);
+#ifdef __ARM_NEON
+        if ((flags & 0x18u) == 8u && rows >= 512u && width <= (rows >> 7))
+            depth_ready = generate_perspective_depth_rows(zone, entry, width, rows, aligned);
+#endif
+        if (!depth_ready) {
+            uint8_t *end = zone + (uint64_t)(aligned * 2u) * 4u;
+            gpu3d_raster_row_ramp_generate
+                ((int *)(entry), (float *)(zone), (float *)(end), width);
+            gpu3d_raster_perspective_divide_fix15
+                ((int16_t *)(zone), (const float *)(zone), (const float *)(end), rows);
+        }
     } else {
         gpu2d_compose_gen_row_ramp_halfword
             ((uint16_t *)(zone), entry, width,
@@ -2062,8 +2739,9 @@ void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entr
             gpu3d_raster_word_fill
                 ((uint32_t *)(tmp), state_line, rows);
         } else {
-            gpu3d_raster_scale_vertex_row
-                ((int32_t *)(tmp), entry, (const int16_t *)(zone), width);
+            if (!depth_ready)
+                gpu3d_raster_scale_vertex_row
+                    ((int32_t *)(tmp), entry, (const int16_t *)(zone), width);
             state_line = 0;
         }
 
@@ -2217,7 +2895,29 @@ void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entr
                 hdr->band_mark = hdr->band_mark & ~mask;
             }
             state_line = 0;
-            for (uint32_t i = 0; i < rows; ++i) {
+            uint32_t i = 0;
+#ifdef __ARM_NEON
+            if (rows >= 8u) {
+                const uint32x4_t selector = vdupq_n_u32(control);
+                const uint32x4_t layer_bits = vdupq_n_u32(0x3f000000u);
+                int32x4_t totals = vdupq_n_s32(0);
+                for (; rows - i >= 8u; i += 8u) {
+                    const uint32_t *source = (const uint32_t *)(line + (uint64_t)i * 4u);
+                    uint32x4_t word0 = vld1q_u32(source);
+                    uint32x4_t word1 = vld1q_u32(source + 4);
+                    uint32x4_t keep0 = vandq_u32(vtstq_u32(veorq_u32(word0, selector), layer_bits),
+                        vcltq_s32(vreinterpretq_s32_u32(word0), vdupq_n_s32(0)));
+                    uint32x4_t keep1 = vandq_u32(vtstq_u32(veorq_u32(word1, selector), layer_bits),
+                        vcltq_s32(vreinterpretq_s32_u32(word1), vdupq_n_s32(0)));
+                    uint8x8_t keep = vmovn_u16(vcombine_u16(vmovn_u32(keep0), vmovn_u32(keep1)));
+                    uint8x8_t value = vand_u8(vld1_u8(marks + i), keep);
+                    vst1_u8(marks + i, value);
+                    totals = vaddw_s16(totals, vpaddl_s8(vreinterpret_s8_u8(value)));
+                }
+                state_line = 0u - (uint32_t)vaddvq_s32(totals);
+            }
+#endif
+            for (; i < rows; ++i) {
                 uint32_t word = rd32(zone + (uint64_t)aligned + i * 4u);
                 uint8_t mark = rd8(marks + i);
                 uint32_t test = word ^ control;
@@ -2241,26 +2941,52 @@ void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entr
         uint8_t *base_b = (uint8_t *)recon_buf3d_front((unsigned char *)root);
         uint32_t idx = (control_saved >> 16) & 0x1fu;
 
-        if ((flags & 4u) == 0) {
-            gpu3d_raster_span_edge_stream_fill
-                (entry, (uint16_t *)(work), width, aligned);
-            spu_mixer_accumulate_triple
-                (work, (int16_t *)(work), (int32_t *)(zone), rows, aligned);
-        } else {
-            gpu3d_raster_byte_fill
-                (work, rd16(entry + 6u * RECON_3D_ROW_ARRAY) >> 3, rows);
+        int color_texture_interpolated = 0;
+#ifdef __ARM_NEON
+        if ((flags & 6u) == 2u && texture_rows_are_complete(entry, width, rows)) {
+            interpolate_color_texture_rows(work, entry, (const int16_t *)zone, width, rows, aligned, marks);
+            color_texture_interpolated = 1;
+        }
+#endif
+        if (!color_texture_interpolated) {
+            if ((flags & 4u) == 0) {
+                gpu3d_raster_span_edge_stream_fill
+                    (entry, (uint16_t *)(work), width, aligned);
+                spu_mixer_accumulate_triple
+                    (work, (int16_t *)(work), (int32_t *)(zone), rows, aligned);
+            } else {
+                gpu3d_raster_byte_fill
+                    (work, rd16(entry + 6u * RECON_3D_ROW_ARRAY) >> 3, rows);
 
-            gpu3d_raster_byte_fill
-                (work + aligned, rd16(entry + 6u * RECON_3D_ROW_ARRAY + 2u) >> 3, rows);
-            gpu3d_raster_byte_fill
-                (work + (uint64_t)aligned * 2u, rd16(entry + 8u * RECON_3D_ROW_ARRAY + 2u) >> 3, rows);
+                gpu3d_raster_byte_fill
+                    (work + aligned, rd16(entry + 6u * RECON_3D_ROW_ARRAY + 2u) >> 3, rows);
+                gpu3d_raster_byte_fill
+                    (work + (uint64_t)aligned * 2u, rd16(entry + 8u * RECON_3D_ROW_ARRAY + 2u) >> 3, rows);
+            }
         }
 
         if ((flags & 2u) != 0) {
-            gpu3d_raster_row_fill_constants
-                (entry, (uint32_t *)(list), width, aligned);
-            spu_mixer_accumulate_pair
-                ((int16_t *)(list), (int32_t *)(list), (const int16_t *)(zone), rows, aligned);
+            if (!color_texture_interpolated) {
+#ifdef __ARM_NEON
+                if (texture_rows_are_complete(entry, width, rows)) {
+                    interpolate_texture_rows((int16_t *)list, entry, (const int16_t *)zone, width, rows);
+                } else
+#endif
+                {
+                    gpu3d_raster_row_fill_constants
+                        (entry, (uint32_t *)(list), width, aligned);
+                    spu_mixer_accumulate_pair
+                        ((int16_t *)(list), (int32_t *)(list), (const int16_t *)(zone), rows, aligned);
+                }
+            }
+#ifdef __ARM_NEON
+            if (state_line != rows && rows >= 16u && rows <= RECON_3D_WIDTH
+                && 2u * ((rows + 15u) & ~15u) <= aligned) {
+                shade_visible_texture_runs(base_b, (const gpu3d_t *)root_secondary,
+                    order, list, work, aligned, idx, rows, marks, flags);
+            } else
+#endif
+            {
             gpu3d_raster_texture_wrap_dispatch
                 ((uint8_t *)order, (uint32_t *)(list), (const int16_t *)(list), rows, marks);
             {
@@ -2275,10 +3001,19 @@ void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entr
                 }
             }
 
+#ifdef __ARM_NEON
+            uint32_t blend_mode = order->polygon_attr & 0x30u;
+            if ((flags & 4u) != 0 && (blend_mode == 0u || blend_mode == 0x30u)) {
+                uint32_t color = (uint32_t)work[0] | ((uint32_t)work[aligned] << 8)
+                               | ((uint32_t)work[(uint64_t)aligned * 2u] << 16) | (idx << 24);
+                modulate_constant_rgba(list, color, (int32_t)rows);
+            } else
+#endif
             gpu3d_raster_texel_blend_dispatch
                 (base_b, (const gpu3d_t *)(root_secondary), (const gpu3d_polygon_t *)((uint8_t *)order), list, list, work,
                  aligned, idx, rows);
 
+            }
             gpu3d_raster_span_component_gate_filter
                 (marks, list, base_a->alpha_test_ref, rows, &state_line);
             if (state_line == 0)
@@ -2296,6 +3031,16 @@ void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entr
         if ((flags & 1u) != 0) {
 
             uint8_t *dest = state + ((uint64_t)column * RECON_3D_WIDTH) + RECON_3D_PLANE2;
+#ifdef __ARM_NEON
+            if ((base_a->disp3dcnt & 8u) != 0 && rows != 0 && rows <= RECON_3D_WIDTH
+                && 2u * ((rows + 15u) & ~15u) <= aligned) {
+                uint32_t selector = order->polygon_attr;
+                if (selector & 0x8000u)
+                    hdr->band_dirty = 1;
+                blend_translucent_span(zone, aligned, rows, mode, selector);
+            } else
+#endif
+            {
             if ((base_a->disp3dcnt & 8u) == 0) {
                 gpu3d_raster_pixel_alpha_max
                     (list, zone + (uint64_t)aligned * 14u, rows, work);
@@ -2335,6 +3080,7 @@ void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entr
                                       zone + (uint64_t)aligned * 17u, mode,
                                       work, marks, (int32_t)rows);
                 break;
+            }
             }
             gpu3d_raster_span_copy_triple_512(entry,
                                (uint32_t *)(void *)page,
@@ -2538,36 +3284,43 @@ void gpu3d_raster_span_key_tolerance_mask(uint8_t *param_1, uint32_t param_2,
 #include <stdint.h>
 #include <string.h>
 
+#ifdef __ARM_NEON
+static inline uint8x8_t depth_compare_eight(const uint32_t *values,
+                                          const uint32_t *thresholds)
+{
+    const uint32x4_t m24 = vdupq_n_u32(0x00ffffffu);
+    uint32x4_t a0 = vandq_u32(vld1q_u32(values), m24);
+    uint32x4_t a1 = vandq_u32(vld1q_u32(values + 4), m24);
+    uint32x4_t u0 = vld1q_u32(thresholds);
+    uint32x4_t u1 = vld1q_u32(thresholds + 4);
+    return vmovn_u16(vcombine_u16(vmovn_u32(vcgtq_u32(a0, u0)),
+                                  vmovn_u32(vcgtq_u32(a1, u1))));
+}
+#endif
+
 void *gpu3d_raster_span_value_over_mask_array(uint8_t *mask, const uint32_t *thresholds,
                           const uint32_t *values, int32_t n, uint32_t *count)
 {
 
 #ifdef __ARM_NEON
-
     {
-
-        const uint32x4_t m24 = vdupq_n_u32(0x00ffffffu);
         uint16x4_t acc = vdup_n_u16(0);
         uint8_t *out = mask;
         const uint32_t *pv = values, *pu = thresholds;
-        int32_t w3 = n;
-        for (;;) {
-            uint32x4_t a0 = vandq_u32(vld1q_u32(pv),     m24);
-            uint32x4_t a1 = vandq_u32(vld1q_u32(pv + 4), m24);
-            uint32x4_t u0 = vld1q_u32(pu), u1 = vld1q_u32(pu + 4);
+        int32_t w3 = n - 8;
+        uint8x8_t m = depth_compare_eight(pv, pu);
+        pv += 8; pu += 8;
+        vst1_u8(out, m); out += 8;
+        while (w3 > 0) {
+            acc = vpadal_u8(acc, vshr_n_u8(m, 7));
+            m = depth_compare_eight(pv, pu);
             pv += 8; pu += 8;
-            uint8x8_t m = vmovn_u16(vcombine_u16(vmovn_u32(vcgtq_u32(a0, u0)),
-                                                 vmovn_u32(vcgtq_u32(a1, u1))));
             vst1_u8(out, m); out += 8;
             w3 -= 8;
-            if (w3 <= 0) {
-                int64_t bits = (int64_t)(-w3) * 8;
-                uint64x1_t d = vshl_u64(vreinterpret_u64_u8(m), vdup_n_s64(bits));
-                acc = vpadal_u8(acc, vshr_n_u8(vreinterpret_u8_u64(d), 7));
-                break;
-            }
-            acc = vpadal_u8(acc, vshr_n_u8(m, 7));
         }
+        int64_t bits = (int64_t)(-w3) * 8;
+        uint64x1_t d = vshl_u64(vreinterpret_u64_u8(m), vdup_n_s64(bits));
+        acc = vpadal_u8(acc, vshr_n_u8(vreinterpret_u8_u64(d), 7));
         *count = vaddlv_u16(acc);
         return out;
     }

@@ -8,6 +8,10 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#endif
 #include <sched.h>
 #include "frontend/video_out_gl.h"
 #include "seedlessds/platform.h"
@@ -493,13 +497,17 @@ static engine_t engines[ENGINES];
 typedef struct { unsigned char *shadow[ENGINES]; unsigned copy_generation[ENGINES]; unsigned id; } worker_t;
 static pthread_t threads[MAX_THREADS];
 static worker_t tr[MAX_THREADS + 1];
+#if !defined(__linux__)
 static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv_ir = PTHREAD_COND_INITIALIZER;
+#endif
 static unsigned n_threads;
 static volatile unsigned any_active;
 static volatile unsigned sleeping;
 static int shutdown = -1, boss_only;
 static recon_b2_job *ring[RING];
+static recon_b2_job *job_pool[RING];
+static unsigned next_job;
 static recon_b2_job *draft[ENGINES];
 static volatile unsigned head __attribute__((aligned(64)));
 static volatile unsigned tail   __attribute__((aligned(64)));
@@ -530,25 +538,33 @@ static void *loop(void *p)
         if (c == __atomic_load_n(&head, __ATOMIC_ACQUIRE)) {
             if (++turns < SPINS_BEFORE_SLEEP) { __asm__ __volatile__("yield"); continue; }
             turns = 0;
+#if defined(__linux__)
+            __atomic_fetch_add(&sleeping, 1u, __ATOMIC_SEQ_CST);
+            unsigned expected = __atomic_load_n(&head, __ATOMIC_SEQ_CST);
+            if (__atomic_load_n(&tail, __ATOMIC_SEQ_CST) == expected)
+                (void)syscall(SYS_futex, (unsigned *)&head, FUTEX_WAIT_PRIVATE,
+                              expected, NULL, NULL, 0);
+            __atomic_fetch_sub(&sleeping, 1u, __ATOMIC_SEQ_CST);
+#else
             pthread_mutex_lock(&mtx);
             __atomic_fetch_add(&sleeping, 1u, __ATOMIC_SEQ_CST);
             while (__atomic_load_n(&tail, __ATOMIC_SEQ_CST) == __atomic_load_n(&head, __ATOMIC_SEQ_CST))
                 pthread_cond_wait(&cv_ir, &mtx);
             __atomic_fetch_sub(&sleeping, 1u, __ATOMIC_SEQ_CST);
             pthread_mutex_unlock(&mtx);
+#endif
             continue;
         }
         turns = 0;
         unsigned r = c % RING;
-        recon_b2_job *w = ring[r];
-        if (!__atomic_load_n(&w->ready, __ATOMIC_ACQUIRE)) { sched_yield(); continue; }
+        recon_b2_job *w = __atomic_load_n(&ring[r], __ATOMIC_ACQUIRE);
         if (!__atomic_compare_exchange_n(&tail, &c, c + 1u, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
         unsigned mine = w->engine_idx;
         run_job(t, w);
-        __atomic_store_n(&w->busy, 0, __ATOMIC_RELEASE);
 #ifdef RECON_DIAG
         if (w->engine_idx != mine) nds_trace_2d_race();
 #endif
+        __atomic_store_n(&w->busy, 0, __ATOMIC_RELEASE);
         __atomic_fetch_sub(&engines[mine].in_flight, 1u, __ATOMIC_ACQ_REL);
     }
 }
@@ -587,7 +603,9 @@ static int start_once_1(void)
     for (unsigned i = 0; i < RING; i++) {
         void *m = 0;
         if (posix_memalign(&m, 64, sizeof(recon_b2_job)) != 0) { shutdown = 1; return 0; }
-        ring[i] = (recon_b2_job *)m; ring[i]->busy = ring[i]->ready = 0;
+        job_pool[i] = (recon_b2_job *)m;
+        job_pool[i]->busy = job_pool[i]->ready = 0;
+        ring[i] = job_pool[i];
     }
     for (unsigned m = 0; m < ENGINES; m++) {
         void *q = 0;
@@ -645,7 +663,7 @@ int recon_b2_active(const void *ctx) { return engine_of(ctx) >= 0; }
 
 recon_b2_job *recon_b2_take(const void *ctx)
 {
-    if (boss_only) return ring[0];
+    if (boss_only) return job_pool[0];
     int m = engine_of(ctx);
     return draft[m < 0 ? 0 : m];
 }
@@ -662,11 +680,19 @@ void recon_b2_enqueue(recon_b2_job *w, const void *ctx)
     prod_close();
 
     recon_b2_job *d;
+    unsigned slot;
     for (;;) {
-        d = ring[head % RING];
-        if (!__atomic_load_n(&d->busy, __ATOMIC_ACQUIRE)) break;
+        slot = next_job;
+        unsigned checked = 0;
+        for (; checked < RING; checked++) {
+            d = job_pool[slot];
+            if (!__atomic_load_n(&d->busy, __ATOMIC_ACQUIRE)) break;
+            slot = (slot + 1u) % RING;
+        }
+        if (checked < RING) break;
         prod_open(); sched_yield(); prod_close();
     }
+    next_job = (slot + 1u) % RING;
     unsigned r = head % RING;
     memcpy(d, w, (size_t)(d->buf - (uint8_t *)d) + sizeof d->buf);
     d->prep.buf = (uint8_t *)(((uintptr_t)d->buf + 15) & ~(uintptr_t)15);
@@ -675,18 +701,31 @@ void recon_b2_enqueue(recon_b2_job *w, const void *ctx)
     if (rd_ptr(w->cap + 64) == w->row_source) wr_ptr(d->cap + 64, d->row_source);
     if (d->prep.three == w->three_copy) d->prep.three = d->three_copy;
     __atomic_store_n(&d->ready, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&ring[r], d, __ATOMIC_RELEASE);
     __atomic_store_n(&head, head + 1u, __ATOMIC_SEQ_CST);
     prod_open();
     if (__atomic_load_n(&sleeping, __ATOMIC_SEQ_CST) != 0u) {
+#if defined(__linux__)
+        if ((r & 7u) == 7u)
+            (void)syscall(SYS_futex, (unsigned *)&head, FUTEX_WAKE_PRIVATE,
+                          1, NULL, NULL, 0);
+#else
         pthread_mutex_lock(&mtx);
         pthread_cond_signal(&cv_ir);
         pthread_mutex_unlock(&mtx);
+#endif
     }
 }
 
 static void drain_engine(int m)
 {
     if (boss_only || m < 0) return;
+#if defined(__linux__)
+    if (__atomic_load_n(&engines[m].in_flight, __ATOMIC_ACQUIRE) != 0u
+        && __atomic_load_n(&sleeping, __ATOMIC_SEQ_CST) != 0u)
+        (void)syscall(SYS_futex, (unsigned *)&head, FUTEX_WAKE_PRIVATE,
+                      MAX_THREADS, NULL, NULL, 0);
+#endif
 #ifdef RECON_DIAG
     unsigned long turns = 0;
     while (__atomic_load_n(&engines[m].in_flight, __ATOMIC_ACQUIRE) != 0) {
@@ -706,6 +745,26 @@ static void drain_engine(int m)
 
 void recon_b2_drain(const void *ctx) { drain_engine(engine_of(ctx)); }
 
+static void dispatch_begin(int m, unsigned char *obj, uint32_t start, uint32_t end, void *arg)
+{
+    engines[m].obj = obj;
+    if (engines[m].generation == 0u) memcpy(engines[m].template, obj, OBJ_SIZE);
+    engines[m].generation++;
+    engines[m].active = 1;
+    __atomic_fetch_add(&any_active, 1u, __ATOMIC_ACQ_REL);
+    gpu2d_line_process_range((gpu2d_engine_t *)obj, start, end, arg);
+}
+
+static void dispatch_end(int m)
+{
+    drain_engine(m);
+    engines[m].active = 0;
+    __atomic_fetch_sub(&any_active, 1u, __ATOMIC_ACQ_REL);
+#ifdef RECON_DIAG
+    if (m == 0 && (engines[0].generation & 255u) == 0u) nds_trace_2d_report(engines[0].generation);
+#endif
+}
+
 static int dispatch(int m, unsigned char *obj, uint32_t start, uint32_t end, void *arg)
 {
     if (recon_scale_out <= 2u || start > end) return 0;
@@ -718,20 +777,27 @@ static int dispatch(int m, unsigned char *obj, uint32_t start, uint32_t end, voi
 #endif
         return 0;
     }
-    engines[m].obj = obj;
-    if (engines[m].generation == 0u) memcpy(engines[m].template, obj, OBJ_SIZE);
-    engines[m].generation++;
-    engines[m].active = 1;
-    __atomic_fetch_add(&any_active, 1u, __ATOMIC_ACQ_REL);
-    gpu2d_line_process_range((gpu2d_engine_t *)obj, start, end, arg);
-    drain_engine(m);
-    engines[m].active = 0;
-    __atomic_fetch_sub(&any_active, 1u, __ATOMIC_ACQ_REL);
-#ifdef RECON_DIAG
-    if (m == 0 && (engines[0].generation & 255u) == 0u) nds_trace_2d_report(engines[0].generation);
-#endif
+    dispatch_begin(m, obj, start, end, arg);
+    dispatch_end(m);
     return 1;
 }
+
+int recon_compose_pair_shared(gpu_t *gpu, void *arg)
+{
+    if (recon_scale_out <= 2u) return 0;
+    for (unsigned i = 0; i < 4u; i++) {
+        const dma_channel_t *channel = &gpu->vram.bus->dma[0].channels[i];
+        if ((int32_t)channel->cnt < 0 && channel->start_mode == 4u) return 0;
+    }
+    if (!start_threads() || boss_only) return 0;
+    if (!frame_distributable((unsigned char *)&gpu->engine[0], (unsigned char *)arg)) return 0;
+    dispatch_begin(0, (unsigned char *)&gpu->engine[0], 0, 191, arg);
+    dispatch_begin(1, (unsigned char *)&gpu->engine[1], 0, 191, 0);
+    dispatch_end(0);
+    dispatch_end(1);
+    return 1;
+}
+
 
 int recon_compose_a_shared(gpu2d_engine_t *obj, uint32_t start, uint32_t end, void *arg) { return dispatch(0, (unsigned char *)obj, start, end, arg); }
 

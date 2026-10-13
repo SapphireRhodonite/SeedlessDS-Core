@@ -999,9 +999,8 @@ static inline uint8x16_t f948_wins(uint8x16_t n0, uint8x16_t n1,
     uint8x16_t g2 = vcgtq_u8(n2, c2);
     uint8x16_t g1 = vcgtq_u8(n1, c1);
     uint8x16_t g0 = vcgtq_u8(n0, c0);
-    uint8x16_t t1 = vandq_u8(e2, g1);
-    uint8x16_t t0 = vandq_u8(vandq_u8(e2, e1), g0);
-    uint8x16_t r  = vorrq_u8(vorrq_u8(g2, t1), t0);
+    uint8x16_t lower = vbslq_u8(e1, g0, g1);
+    uint8x16_t r = vbslq_u8(e2, lower, g2);
     return vbicq_u8(r, vceqq_u8(c3, n3));
 }
 #endif

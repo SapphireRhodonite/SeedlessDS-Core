@@ -15,8 +15,10 @@ target_compile_options(seedless_lua PRIVATE -O2 -fPIC -w)
 target_include_directories(seedless_lua PUBLIC "${SEEDLESS_LUA_DIR}")
 set_target_properties(seedless_lua PROPERTIES C_VISIBILITY_PRESET hidden)
 
-set(SEEDLESS_UNRAR_URL    "https://www.rarlab.com/rar/unrarsrc-5.0.14.tar.gz")
-set(SEEDLESS_UNRAR_SHA256 "e276ea30a2dc9b8961a4268772e5b6caccaa984664e2d5255a43fcb0f5d59806")
+set(SEEDLESS_LIBARCHIVE_URL "https://www.libarchive.org/downloads/libarchive-3.8.9.tar.xz")
+set(SEEDLESS_LIBARCHIVE_SHA256 "888c934f9d95648ecb9163dc8e23ab80a476ecb81a8f1154704a227b5b676dde")
+set(SEEDLESS_UNARR_URL "https://github.com/selmf/unarr/releases/download/v1.1.1/unarr-1.1.1.tar.xz")
+set(SEEDLESS_UNARR_SHA256 "328efa04ea996dd38916b1247a8cf176ac29b85caf92174e34d31998de4174d2")
 set(SEEDLESS_LZMA_URL     "https://www.7-zip.org/a/lzma920.tar.bz2")
 set(SEEDLESS_LZMA_SHA256  "8ac221acdca8b6f6dd110120763af42b3707363752fc04e63c7bbff76774a445")
 if(NOT SEEDLESS_THIRD_PARTY_DIR)
@@ -61,43 +63,71 @@ function(seedless_rewrite path old new)
     file(WRITE "${path}" "${src}")
 endfunction()
 
-seedless_fetch(unrar "${SEEDLESS_UNRAR_URL}" "${SEEDLESS_UNRAR_SHA256}" unrarsrc-5.0.14.tar.gz unrar-5.0.14)
-set(SEEDLESS_UNRAR_DIR "${SEEDLESS_THIRD_PARTY_DIR}/unrar-5.0.14/unrar")
-seedless_rewrite("${SEEDLESS_UNRAR_DIR}/file.cpp"
-    "#include \"rar.hpp\"\n"
-    "#include \"rar.hpp\"\nextern \"C\" int recon_archive_open(const char *path, int flags);\nextern \"C\" FILE *recon_archive_fopen(const char *path, const char *mode);\n")
-seedless_rewrite("${SEEDLESS_UNRAR_DIR}/file.cpp"
-    "  int handle=open(NameA,flags);"
-    "  int handle=recon_archive_open(NameA,flags);")
-seedless_rewrite("${SEEDLESS_UNRAR_DIR}/file.cpp"
-    "  hFile=fopen(NameA,WriteMode ? WRITEBINARY:CREATEBINARY);"
-    "  hFile=recon_archive_fopen(NameA,WriteMode ? WRITEBINARY:CREATEBINARY);")
+seedless_fetch(libarchive "${SEEDLESS_LIBARCHIVE_URL}" "${SEEDLESS_LIBARCHIVE_SHA256}" libarchive-3.8.9.tar.xz libarchive-3.8.9)
+set(SEEDLESS_LIBARCHIVE_DIR "${SEEDLESS_THIRD_PARTY_DIR}/libarchive-3.8.9/libarchive-3.8.9")
+function(seedless_add_libarchive)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    foreach(feature MBEDTLS NETTLE OPENSSL LIBB2 LZ4 LZO LZMA ZSTD BZip2 LIBXML2 EXPAT
+                    WIN32_XMLLITE PCREPOSIX PCRE2POSIX LIBGCC CNG TAR CPIO CAT UNZIP
+                    XATTR ACL ICONV TEST COVERAGE INSTALL)
+        set(ENABLE_${feature} OFF CACHE BOOL "" FORCE)
+    endforeach()
+    set(ENABLE_ZLIB ON CACHE BOOL "" FORCE)
+    add_subdirectory("${SEEDLESS_LIBARCHIVE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/libarchive" EXCLUDE_FROM_ALL)
+    get_target_property(archive_sources archive_static SOURCES)
+    set(reader_sources)
+    foreach(source IN LISTS archive_sources)
+        if(source MATCHES "(^|/)archive_write" OR source MATCHES "(^|/)archive_read_disk")
+            continue()
+        endif()
+        if(source MATCHES "(^|/)archive_read_support_format_" AND
+           NOT source MATCHES "archive_read_support_format_rar5?\\.c$")
+            continue()
+        endif()
+        if(source MATCHES "(^|/)archive_read_support_filter_" AND
+           NOT source MATCHES "archive_read_support_filter_none\\.c$")
+            continue()
+        endif()
+        list(APPEND reader_sources "${source}")
+    endforeach()
+    set_target_properties(archive_static PROPERTIES SOURCES "${reader_sources}")
+    set_target_properties(archive_static PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+    target_include_directories(archive_static INTERFACE "${SEEDLESS_LIBARCHIVE_DIR}/libarchive")
+    target_compile_options(archive_static PRIVATE -ffunction-sections -fdata-sections)
+endfunction()
+seedless_add_libarchive()
+add_library(seedless_libarchive ALIAS archive_static)
 
-seedless_rewrite("${SEEDLESS_UNRAR_DIR}/unicode.cpp"
-    "#define MBFUNCTIONS\n"
-    "#undef MBFUNCTIONS\n")
-seedless_rewrite("${SEEDLESS_UNRAR_DIR}/unicode.cpp"
-    "#elif defined(_APPLE)\n  WideToUtf(Src,Dest,DestSize);"
-    "#elif defined(_APPLE) || defined(__ANDROID__)\n  WideToUtf(Src,Dest,DestSize);")
-seedless_rewrite("${SEEDLESS_UNRAR_DIR}/unicode.cpp"
-    "#elif defined(_APPLE)\n  UtfToWide(Src,Dest,DestSize);"
-    "#elif defined(_APPLE) || defined(__ANDROID__)\n  UtfToWide(Src,Dest,DestSize);")
-set(SEEDLESS_UNRAR_OBJ rar strlist strfn pathfn smallfn global file filefn filcreat
-    archive arcread unicode system isnt crypt crc rawread encname
-    resource match timefn rdwrfn consio options errhnd rarvm secpassword
-    rijndael getbits sha1 sha256 blake2s hash extinfo extract volume
-    list find unpack headers threadpool rs16 cmddata
-    filestr scantree dll qopen)
-set(SEEDLESS_UNRAR_SRC)
-foreach(o ${SEEDLESS_UNRAR_OBJ})
-    list(APPEND SEEDLESS_UNRAR_SRC "${SEEDLESS_UNRAR_DIR}/${o}.cpp")
+seedless_fetch(unarr "${SEEDLESS_UNARR_URL}" "${SEEDLESS_UNARR_SHA256}" unarr-1.1.1.tar.xz unarr-1.1.1)
+set(SEEDLESS_UNARR_DIR "${SEEDLESS_THIRD_PARTY_DIR}/unarr-1.1.1/unarr-1.1.1")
+seedless_rewrite("${SEEDLESS_UNARR_DIR}/common/stream.c"
+    "#include \"unarr-imp.h\""
+    "#include \"unarr-imp.h\"\nextern FILE *recon_archive_fopen(const char *, const char *);")
+seedless_rewrite("${SEEDLESS_UNARR_DIR}/common/stream.c"
+    "path ? fopen(path, \"rb\")" "path ? recon_archive_fopen(path, \"rb\")")
+seedless_rewrite("${SEEDLESS_UNARR_DIR}/rar/rar.c"
+    "if (!rar_check_header_crc(ar))\n                warn(\"Invalid header checksum @%\" PRIi64, ar->entry_offset);"
+    "if (!rar_check_header_crc(ar)) {\n                warn(\"Invalid header checksum @%\" PRIi64, ar->entry_offset);\n                return false;\n            }")
+seedless_rewrite("${SEEDLESS_UNARR_DIR}/rar/rar.c"
+    "if (!rar_check_header_crc(ar))\n            warn(\"Invalid header checksum @%\" PRIi64, ar->entry_offset);"
+    "if (!rar_check_header_crc(ar)) {\n            warn(\"Invalid header checksum @%\" PRIi64, ar->entry_offset);\n            return false;\n        }")
+seedless_rewrite("${SEEDLESS_UNARR_DIR}/rar/rar.c"
+    "if ((header.flags & LHD_PASSWORD))\n                warn(\"Encrypted entries will fail to uncompress\");"
+    "if ((header.flags & LHD_PASSWORD)) {\n                warn(\"Encrypted entries are unsupported\");\n                return false;\n            }")
+set(SEEDLESS_UNARR_SRC)
+foreach(source common/conv.c common/crc32.c common/stream.c common/unarr.c
+               lzmasdk/Ppmd7.c lzmasdk/Ppmd7aDec.c
+               rar/filter-rar.c rar/uncompress-rar.c rar/huffman-rar.c
+               rar/rar.c rar/rarvm.c rar/parse-rar.c)
+    list(APPEND SEEDLESS_UNARR_SRC "${SEEDLESS_UNARR_DIR}/${source}")
 endforeach()
-add_library(seedless_unrar STATIC ${SEEDLESS_UNRAR_SRC})
-
-target_compile_definitions(seedless_unrar PRIVATE RARDLL RAR_SMP _FILE_OFFSET_BITS=64 _LARGEFILE_SOURCE LITTLE_ENDIAN=1234)
-target_compile_options(seedless_unrar PRIVATE -O2 -fPIC -w -fexceptions -frtti)
-target_include_directories(seedless_unrar PUBLIC "${SEEDLESS_UNRAR_DIR}")
-set_target_properties(seedless_unrar PROPERTIES CXX_VISIBILITY_PRESET hidden)
+add_library(seedless_unarr STATIC ${SEEDLESS_UNARR_SRC})
+target_compile_definitions(seedless_unarr PRIVATE _POSIX_C_SOURCE=200809L NDEBUG HAVE_ZLIB USE_ZLIB_CRC)
+target_compile_options(seedless_unarr PRIVATE -O2 -fPIC -ffunction-sections -fdata-sections)
+target_link_libraries(seedless_unarr PRIVATE z)
+target_include_directories(seedless_unarr PUBLIC "${SEEDLESS_UNARR_DIR}")
+set_target_properties(seedless_unarr PROPERTIES C_VISIBILITY_PRESET hidden)
 
 seedless_fetch(lzma "${SEEDLESS_LZMA_URL}" "${SEEDLESS_LZMA_SHA256}" lzma920.tar.bz2 lzma-9.20)
 set(SEEDLESS_LZMA_DIR "${SEEDLESS_THIRD_PARTY_DIR}/lzma-9.20/C")

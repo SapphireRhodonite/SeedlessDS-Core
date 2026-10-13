@@ -2040,8 +2040,7 @@ void gpu3d_raster_band_bucket_classify_by_depth_hires(gpu3d_t *machine, gpu3d_ba
         int16_t c = cnt[d];
         if (c >= 1) {
 
-            const uint32_t all = (RECON_BANDS >= 32u) ? 0xffffffffu : ((1u << RECON_BANDS) - 1u);
-            uint32_t high = all >> ((RECON_BANDS - 1u) - (uint32_t)((d - 1) / RECON_BAND_ROWS));
+            unsigned last = (unsigned)((d - 1u) / RECON_BAND_ROWS);
             do {
                 c--;
                 uint32_t idx = *(uint16_t *)(lst + d * 4096 + (uint64_t)c * 2);
@@ -2049,10 +2048,9 @@ void gpu3d_raster_band_bucket_classify_by_depth_hires(gpu3d_t *machine, gpu3d_ba
                 uint64_t j = (uint64_t)((uint16_t)(o->vertex_count >> 16) & 7)
                            + o->first_vertex;
                 uint32_t y = ent[j].y;
-                uint32_t mask = (all << (y / RECON_BAND_ROWS)) & high;
+                unsigned first = y / RECON_BAND_ROWS;
 
-                for (unsigned k = 0; k < RECON_BANDS; k++) {
-                    if (!(mask & (1u << k))) continue;
+                for (unsigned k = first; k <= last && k < RECON_BANDS; k++) {
                     uint32_t *cc = &list[k].count;
                     uint16_t *l = (uint16_t *)list[k].list;
                     l[*cc] = (uint16_t)idx;
@@ -2171,12 +2169,10 @@ void gpu3d_raster_band_bucket_classify_hires(gpu3d_t *machine, gpu3d_band_bucket
         int32_t aj = cap - 1;
         if (aj < 0) aj = cap + (int32_t)RECON_WRAP_ROWS;
 
-        const uint32_t all = (RECON_BANDS >= 32u) ? 0xffffffffu : ((1u << RECON_BANDS) - 1u);
-        uint32_t mask = (all >> ((RECON_BANDS - 1u) - (uint32_t)(aj / RECON_BAND_ROWS)))
-                         & (all << ((uint32_t)smaller / RECON_BAND_ROWS));
+        unsigned first = (unsigned)smaller / RECON_BAND_ROWS;
+        unsigned last = (unsigned)aj / RECON_BAND_ROWS;
 
-        for (unsigned k = 0; k < RECON_BANDS; k++) {
-            if (!(mask & (1u << k))) continue;
+        for (unsigned k = first; k <= last && k < RECON_BANDS; k++) {
             uint32_t *cnt = &list[k].count;
             uint16_t *l = (uint16_t *)list[k].list;
             l[*cnt] = (uint16_t)i;
@@ -2864,6 +2860,8 @@ void gpu3d_raster_band_pending_process(void *param_1)
             gpu3d_raster_deinterleave_words_blocks(page, ctx);
             break;
         }
+
+        gpu3d_raster_band_compose_complete(table, idx);
 
         if (tail_n == 2 && cq == 0)
             tail_force[1] = hdr->band_dirty != 0u;

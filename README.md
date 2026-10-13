@@ -12,10 +12,14 @@ The SeedlessDS application owns the Android JNI layer and build configuration. I
 
 ## Dependencies
 
-Initialize the Lua submodule with `git submodule update --init --recursive`. Lua 5.3.0, UnRAR 5.0.14, LZMA SDK 9.20 and Android's zlib provide the scripting and archive dependencies. UnRAR and LZMA SDK are fetched from pinned sources with SHA-256 verification. See [third_party/LICENSES.md](third_party/LICENSES.md) for attribution, licenses and build locations.
+Initialize the Lua submodule with `git submodule update --init --recursive`. Lua 5.3.0, libarchive 3.8.9, unarr 1.1.1, LZMA SDK 9.20 and Android's zlib provide the scripting and archive dependencies. Libarchive, unarr and LZMA SDK are fetched from pinned sources with SHA-256 verification. See [third_party/LICENSES.md](third_party/LICENSES.md) for attribution, licenses and build locations.
 
 The Android build also links the system logging, OpenSL ES and OpenGL ES libraries. See the SeedlessDS app's build instructions for the SDK, NDK, CMake and JDK versions.
 
 ## Attribution
 
-DraStic is the work of its original authors, including Exophase. This library is a reconstruction of that emulator, not an official DraStic release. Games, original BIOS/firmware images and the original DraStic binary are not included. A project-wide license has not yet been selected; dependencies retain their own licenses.
+DraStic is the work of its original authors, including Exophase. This library is a reconstruction of that emulator, not an official DraStic release. Games, original BIOS/firmware images and the original DraStic binary are not included.
+
+## License
+
+Original or authorized project code is licensed under GPL-3.0-or-later; see [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md). Dependencies retain their individual terms and attribution.

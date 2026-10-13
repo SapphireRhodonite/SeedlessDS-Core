@@ -122,6 +122,7 @@ unsigned recon_height_get(const unsigned char *o, unsigned fallback);
 extern unsigned recon_bands_3d;
 extern unsigned recon_band_rows;
 void recon_bands_set(void);
+#define RECON_BAND_CAPACITY 96u
 #define RECON_BANDS      (recon_bands_3d)
 #define RECON_BAND_ROWS (recon_band_rows)
 

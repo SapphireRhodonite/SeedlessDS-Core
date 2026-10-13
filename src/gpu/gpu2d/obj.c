@@ -1,3 +1,6 @@
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #include <stdint.h>
 #include <string.h>
 #include <stddef.h>
@@ -174,7 +177,42 @@ uint32_t gpu2d_obj_draw_line(gpu2d_engine_t *ctx, uint8_t *px, uint8_t *atr,
             case 6:
                 dat = s->data;
                 p   = dat + (size_t)(row * step);
-                for (j = 0; j < width; j++) {
+                j = 0;
+#ifdef __ARM_NEON
+                if (width >= 8u && sx >= 0 && (uint32_t)sx + width <= 256u) {
+                    uint8_t *colors = pix(px, sx);
+                    uint8_t *attributes = atr + sx;
+                    const uint8_t *first = type == 2 ? p : p - 2u * (width - 1u);
+                    uintptr_t src_begin = (uintptr_t)first;
+                    uintptr_t src_end = src_begin + width * 2u;
+                    uintptr_t color_begin = (uintptr_t)colors;
+                    uintptr_t color_end = color_begin + width * 2u;
+                    uintptr_t attr_begin = (uintptr_t)attributes;
+                    uintptr_t attr_end = attr_begin + width;
+                    if ((src_end <= color_begin || color_end <= src_begin)
+                        && (src_end <= attr_begin || attr_end <= src_begin)
+                        && (color_end <= attr_begin || attr_end <= color_begin)) {
+                        uint8x8_t attribute = vdup_n_u8(attr);
+                        for (; j + 8u <= width; j += 8u) {
+                            uint16x8_t pixels = vld1q_u16((const uint16_t *)(type == 2 ? p : p - 14));
+                            if (type == 6) {
+                                pixels = vrev64q_u16(pixels);
+                                pixels = vextq_u16(pixels, pixels, 4);
+                            }
+                            uint16x8_t active = vreinterpretq_u16_s16(vshrq_n_s16(vreinterpretq_s16_u16(pixels), 15));
+                            uint8x8_t active_bytes = vmovn_u16(active);
+                            uint16x8_t previous = vld1q_u16((const uint16_t *)(colors + j * 2u));
+                            uint8x8_t old_marks = vld1_u8(padded + sx + j);
+                            uint8x8_t old_attributes = vld1_u8(attributes + j);
+                            vst1q_u16((uint16_t *)(colors + j * 2u), vbslq_u16(active, pixels, previous));
+                            vst1_u8(padded + sx + j, vbsl_u8(active_bytes, vshrn_n_u16(pixels, 8), old_marks));
+                            vst1_u8(attributes + j, vbsl_u8(active_bytes, attribute, old_attributes));
+                            p = type == 2 ? p + 16 : p - 16;
+                        }
+                    }
+                }
+#endif
+                for (; j < width; j++) {
                     int16_t c = rd16s(p);
                     if (c < 0) {
                         wr16(pix(px, sx + (int32_t)j), (uint16_t)c);

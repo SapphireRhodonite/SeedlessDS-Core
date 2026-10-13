@@ -347,6 +347,75 @@ void gpu3d_raster_toon_highlight_pack(const unsigned char *table,
     } while (n != 0);
 }
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+static inline uint8x16_t modulate_mono_rgb(uint8x16_t color, uint8x16_t factor);
+static __attribute__((noinline)) void *blend_mono_rgba_inplace(
+    uint8_t *dst, const uint8_t *plane, uint8_t alpha, long count);
+
+static __attribute__((noinline)) uint32_t blend_mono_highlight_inplace(
+    const uint8_t *table, uint8_t *pixels, const uint8_t *levels,
+    uint8_t alpha_value, uint32_t count)
+{
+    if (count < 16u)
+        return 0;
+    uint64_t rounded = ((uint64_t)count + 15u) & ~UINT64_C(15);
+    if (rounded > UINTPTR_MAX / 4u)
+        return 0;
+    uint32_t complete = count & ~15u;
+    uintptr_t dst = (uintptr_t)pixels, src = (uintptr_t)levels;
+    uintptr_t tables = (uintptr_t)table;
+    uintptr_t bytes = (uintptr_t)rounded * 4u;
+    if ((dst >= src ? dst - src < rounded : src - dst < bytes) ||
+        (dst >= tables ? dst - tables < 96u : tables - dst < bytes))
+        return 0;
+
+    for (uint32_t i = 0; i < complete; i += 16u) {
+        if (vmaxvq_u8(vld1q_u8(levels + i)) > 63u)
+            return 0;
+    }
+
+    for (uint32_t i = complete; i < count; ++i) {
+        if (levels[i] > 63u)
+            return 0;
+    }
+
+    const uint8x16_t limit = vdupq_n_u8(63);
+    const uint8x16x2_t red = {{vminq_u8(vld1q_u8(table), limit),
+                              vminq_u8(vld1q_u8(table + 16), limit)}};
+    const uint8x16x2_t green = {{vminq_u8(vld1q_u8(table + 32), limit),
+                                vminq_u8(vld1q_u8(table + 48), limit)}};
+    const uint8x16x2_t blue = {{vminq_u8(vld1q_u8(table + 64), limit),
+                               vminq_u8(vld1q_u8(table + 80), limit)}};
+    const uint8x8_t alpha = vdup_n_u8(alpha_value);
+    const uint8x16_t alpha_mask = vdupq_n_u8(31);
+    for (uint32_t i = 0; i < complete; i += 16u) {
+        uint8x16_t factor = vld1q_u8(levels + i);
+        uint8x16_t indices = vshrq_n_u8(factor, 1);
+        uint8x16x4_t color = vld4q_u8(pixels + (size_t)i * 4u);
+        uint8x8_t al = vget_low_u8(color.val[3]), ah = vget_high_u8(color.val[3]);
+        uint16x8_t low = vmlal_u8(vaddl_u8(al, alpha), al, alpha);
+        uint16x8_t high = vmlal_u8(vaddl_u8(ah, alpha), ah, alpha);
+        color.val[0] = vminq_u8(vaddq_u8(vandq_u8(modulate_mono_rgb(color.val[0], factor), limit),
+                                        vqtbl2q_u8(red, indices)), limit);
+        color.val[1] = vminq_u8(vaddq_u8(vandq_u8(modulate_mono_rgb(color.val[1], factor), limit),
+                                        vqtbl2q_u8(green, indices)), limit);
+        color.val[2] = vminq_u8(vaddq_u8(vandq_u8(modulate_mono_rgb(color.val[2], factor), limit),
+                                        vqtbl2q_u8(blue, indices)), limit);
+        color.val[3] = vandq_u8(vcombine_u8(vshrn_n_u16(low, 5), vshrn_n_u16(high, 5)), alpha_mask);
+        vst4q_u8(pixels + (size_t)i * 4u, color);
+    }
+    if (complete != count) {
+        uint8_t *tail = pixels + (size_t)complete * 4u;
+        const uint8_t *tail_levels = levels + complete;
+        uint32_t remaining = count - complete;
+        blend_mono_rgba_inplace(tail, tail_levels, alpha_value, remaining);
+        gpu3d_raster_toon_highlight_add(table, tail, tail_levels, remaining);
+    }
+    return 1;
+}
+#endif
+
 void *gpu3d_raster_texel_blend_dispatch(const unsigned char *a0, const gpu3d_t *a1,
                           const gpu3d_polygon_t *a2, unsigned char *a3,
                           const unsigned char *a4, unsigned char *a5,
@@ -405,6 +474,11 @@ void *gpu3d_raster_texel_blend_dispatch(const unsigned char *a0, const gpu3d_t *
         memcpy(&flag, recon_cfg3d(a0), 1);
 
         if (flag & 2u) {
+#ifdef __ARM_NEON
+            if (a3 == a4 && blend_mono_highlight_inplace(
+                    a1->toon_table_expanded[0], a3, a5, (uint8_t)a7, a8))
+                return NULL;
+#endif
             gpu3d_raster_texel_blend_mono_alpha(a3, a4, a5, a7, a8);
 
             if (a8 != 0) {
@@ -1487,8 +1561,9 @@ void gpu3d_raster_texture_decode_4x4_compressed(void *node_v, uint32_t *texel_bi
             }
         }
 
-        void *newpal = core_malloc((unsigned long)count * 4u);
+        void *newpal = core_malloc((unsigned long)count * 4u + (unsigned long)total_texels + 16u);
         memcpy(newpal, palette, (size_t)count * 4u);
+        wr32((uint8_t *)newpal + (size_t)count * 4u + 12u, 0u);
         wr_ptr(node + 24, newpal);
 
         void *newbuf = core_realloc(outbuf, (unsigned long)total_texels);
@@ -1554,6 +1629,52 @@ typedef void  *(*fn_memset_chk)(void *, int, unsigned long, unsigned long);
 
 
 
+static void read_compressed_texture_inputs(uint32_t words[4], uint32_t bits, uint16_t index,
+        uint32_t palette_base, void *const *banks)
+{
+    uint32_t offset = ((uint32_t)(index & 0x3fffu) << 1) + palette_base;
+    const uint8_t *bank = banks[offset >> 13];
+    if (bank == NULL)
+        bank = texture_palette_bank_fallback;
+    const uint8_t *entry = bank + ((size_t)(offset & 0x1fffu) << 1);
+    uint32_t mode = index >> 14;
+    words[0] = bits;
+    words[1] = index;
+    words[2] = (uint32_t)rd16(entry) | ((uint32_t)rd16(entry + 2) << 16);
+    words[3] = 0u;
+    if (mode == 0u || mode == 2u)
+        words[3] = rd16(entry + 4);
+    if (mode == 2u)
+        words[3] |= (uint32_t)rd16(entry + 6) << 16;
+}
+
+static int compressed_texture_inputs_match(const uint32_t *stored, const uint32_t *bits,
+        const uint16_t *indices, uint32_t blocks, uint32_t palette_base, void *const *banks)
+{
+    for (uint32_t block = 0; block < blocks; block++) {
+        uint32_t words[4];
+        read_compressed_texture_inputs(words, bits[block], indices[block], palette_base, banks);
+        if (memcmp(stored + (size_t)block * 4u, words, sizeof words) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static void store_compressed_texture_inputs(uint32_t *stored, const uint32_t *bits,
+        const uint16_t *indices, uint32_t blocks, uint32_t palette_base, void *const *banks)
+{
+    for (uint32_t block = 0; block < blocks; block++)
+        read_compressed_texture_inputs(stored + (size_t)block * 4u,
+            bits[block], indices[block], palette_base, banks);
+}
+
+static uint32_t *compressed_texture_input_cache(gpu3d_texture_entry_t *node, uint32_t area)
+{
+    return (uint32_t *)(node->format == 8u
+        ? node->palette + (size_t)node->palette_count * 4u
+        : node->data + (size_t)area * 4u);
+}
+
 void gpu3d_raster_texture_cache_entry_build(gpu3d_texture_entry_t *node, gpu3d_texture_cache_t *ctx, uint32_t p3, uint32_t p4)
 {
 
@@ -1583,28 +1704,52 @@ void gpu3d_raster_texture_cache_entry_build(gpu3d_texture_entry_t *node, gpu3d_t
     uint32_t channel = vram_off >> 17;
     uint32_t area = sizeS * sizeT;
 
+    int input_cache_enabled = vram->config->threaded_3d == 0u;
     uint8_t *buf0 = node->data;
-    if (buf0 != 0) {
-        uint8_t cache_fmt = node->format;
-        if (cache_fmt != (uint8_t)format) {
-            core_free(buf0);
-            uint8_t *buf1 = node->palette;
-            if (buf1 != 0) core_free(buf1);
-            node->data = 0;
-            node->palette = 0;
-            buf0 = 0;
+    int same = 0;
+    if (input_cache_enabled && format == 5u && buf0 != NULL
+            && node->width == sizeS && node->height == sizeT
+            && (node->format == 5u || (node->format == 8u && node->palette != NULL))) {
+        const uint32_t *input_cache = compressed_texture_input_cache(node, area);
+        const uint8_t *data0 = vram->texture[channel];
+        const uint8_t *data1 = vram->texture[1];
+        same = data0 != NULL && data1 != NULL && input_cache[3] != 0u
+            && input_cache[0] == node->key && input_cache[1] == p4 && input_cache[2] == area
+            && compressed_texture_inputs_match(input_cache + 4,
+                (const uint32_t *)(data0 + narrow_off),
+                (const uint16_t *)(data1 + ((uint64_t)channel << 15) + (narrow_off >> 1)),
+                area >> 4, p4 << 3, (void *const *)vram->texture_palette);
+    }
+    if (same) {
+        if (node->format == 8u)
+            ctx->occupied += area * 4u;
+    } else {
+        if (buf0 != 0) {
+            uint8_t cache_fmt = node->format;
+            if (cache_fmt != (uint8_t)format) {
+                core_free(buf0);
+                uint8_t *buf1 = node->palette;
+                if (buf1 != 0) core_free(buf1);
+                node->data = 0;
+                node->palette = 0;
+                buf0 = 0;
+            }
         }
-    }
-    if (buf0 == 0) {
-        unsigned long size = (unsigned long)area * (unsigned long)rd8((void *)(BPP_TABLE + format));
-        buf0 = (uint8_t *)core_malloc(size);
-        node->data = buf0;
-        uint32_t busy = ctx->occupied;
-        ctx->occupied = busy + (uint32_t)size;
-    }
+        if (buf0 == 0) {
+            unsigned long size = (unsigned long)area * (unsigned long)rd8((void *)(BPP_TABLE + format));
+            unsigned long allocation_size = size + (format == 5u ? (unsigned long)area + 16u : 0u);
+            buf0 = (uint8_t *)core_malloc(allocation_size);
+            if (format == 5u)
+                wr32(buf0 + (size_t)area * 4u + 12u, 0u);
+            node->data = buf0;
+            uint32_t busy = ctx->occupied;
+            ctx->occupied = busy + (uint32_t)size;
+        }
 
-    node->format = (uint8_t)format;
-    node->palette_count = 0;
+        node->format = (uint8_t)format;
+        node->palette_count = 0;
+
+    }
 
     uint32_t shiftamt  = (p3 >> 11) & 0x1fu;
     uint32_t shift_val = rd8((void *)(SHIFT_TABLE + format)) & 0x1fu;
@@ -1620,16 +1765,28 @@ void gpu3d_raster_texture_cache_entry_build(gpu3d_texture_entry_t *node, gpu3d_t
 
     if (format == 5) {
 
-        uint8_t *data0 = vram->texture[channel];
-        uint8_t *data1 = data0 ? vram->texture[1] : NULL;
-        if (data0 == NULL || data1 == NULL) {
-            core_memset(buf0, 0, (unsigned long)(area << 2));
-        } else {
-            void *p1 = data0 + narrow_off;
-            void *p2 = data1 + ((uint64_t)channel << 15) + (narrow_off >> 1);
-            uint32_t size = p4 << 3;
-            void *table = vram->texture_palette;
-            gpu3d_raster_texture_decode_4x4_compressed(node, p1, p2, size, table);
+        if (!same) {
+            uint32_t *input_cache = compressed_texture_input_cache(node, area);
+            input_cache[3] = 0u;
+            uint8_t *data0 = vram->texture[channel];
+            uint8_t *data1 = data0 ? vram->texture[1] : NULL;
+            if (data0 == NULL || data1 == NULL) {
+                core_memset(buf0, 0, (unsigned long)(area << 2));
+            } else {
+                void *p1 = data0 + narrow_off;
+                void *p2 = data1 + ((uint64_t)channel << 15) + (narrow_off >> 1);
+                uint32_t size = p4 << 3;
+                void *table = vram->texture_palette;
+                gpu3d_raster_texture_decode_4x4_compressed(node, p1, p2, size, table);
+                if (input_cache_enabled) {
+                    input_cache = compressed_texture_input_cache(node, area);
+                    store_compressed_texture_inputs(input_cache + 4, p1, p2, area >> 4, size, table);
+                    input_cache[0] = node->key;
+                    input_cache[1] = p4;
+                    input_cache[2] = area;
+                    input_cache[3] = 1u;
+                }
+            }
         }
 
         uint32_t comb = (((channel & 3u) << 15) | 0x20000u) + (narrow_off >> 1);
@@ -2489,12 +2646,61 @@ void gpu3d_raster_texel_index_expand_planes(const unsigned char *tables, unsigne
 #endif
 }
 
+#ifdef __ARM_NEON
+static inline uint8x16_t modulate_mono_rgb(uint8x16_t color, uint8x16_t factor)
+{
+    uint8x8_t cl = vget_low_u8(color), ch = vget_high_u8(color);
+    uint8x8_t fl = vget_low_u8(factor), fh = vget_high_u8(factor);
+    uint16x8_t low = vmlal_u8(vaddl_u8(cl, fl), cl, fl);
+    uint16x8_t high = vmlal_u8(vaddl_u8(ch, fh), ch, fh);
+    return vcombine_u8(vshrn_n_u16(low, 6), vshrn_n_u16(high, 6));
+}
+
+static __attribute__((noinline)) void *blend_mono_rgba_inplace(
+    uint8_t *dst, const uint8_t *plane, uint8_t alpha, long count)
+{
+    uint64_t pixels = count > 0 ? ((uint64_t)count + 15u) & ~(uint64_t)15u : 16u;
+    if (pixels > UINTPTR_MAX / 4u)
+        return NULL;
+    uintptr_t destination = (uintptr_t)dst, source = (uintptr_t)plane;
+    if (destination >= source ? destination - source < pixels
+                              : source - destination < pixels * 4u)
+        return NULL;
+
+    const uint8x8_t a = vdup_n_u8(alpha);
+    do {
+        uint8x16x4_t color = vld4q_u8(dst);
+        uint8x16_t factor = vld1q_u8(plane);
+        uint8x8_t al = vget_low_u8(color.val[3]), ah = vget_high_u8(color.val[3]);
+        uint16x8_t low = vmlal_u8(vaddl_u8(al, a), al, a);
+        uint16x8_t high = vmlal_u8(vaddl_u8(ah, a), ah, a);
+        color.val[0] = modulate_mono_rgb(color.val[0], factor);
+        color.val[1] = modulate_mono_rgb(color.val[1], factor);
+        color.val[2] = modulate_mono_rgb(color.val[2], factor);
+        color.val[3] = vcombine_u8(vshrn_n_u16(low, 5), vshrn_n_u16(high, 5));
+        vst4q_u8(dst, color);
+        dst += 64;
+        plane += 16;
+        pixels -= 16;
+    } while (pixels != 0);
+    return dst;
+}
+#endif
+
 void *gpu3d_raster_texel_blend_mono_alpha(unsigned char *dst,
                           const unsigned char *fg,
                           const unsigned char *plane,
                           unsigned char alpha_const,
                           long count)
 {
+#ifdef __ARM_NEON
+    if (dst == fg) {
+        void *end = blend_mono_rgba_inplace(dst, plane, alpha_const, count);
+        if (end != NULL)
+            return end;
+    }
+#endif
+
 
     unsigned char *pDst = dst;
     const unsigned char *pFg = fg;

@@ -60,24 +60,39 @@ void gpu3d_raster_scale_vertex_row(int32_t *dst, unsigned char *params,
 
 #ifdef __ARM_NEON
 
-        const int32x2_t wr = vdup_n_s32(scale);
-        const int32x4_t vshift = vdupq_n_s32(shift);
-        do {
-            int16x8_t s = vld1q_s16(src);
-            int32x4_t s_lo = vmovl_s16(vget_low_s16(s));
-            int32x4_t s_hi = vmovl_s16(vget_high_s16(s));
-            int64x2_t q0 = vmull_s32(vget_low_s32(s_lo),  wr);
-            int64x2_t q1 = vmull_s32(vget_high_s32(s_lo), wr);
-            int64x2_t q2 = vmull_s32(vget_low_s32(s_hi),  wr);
-            int64x2_t q3 = vmull_s32(vget_high_s32(s_hi), wr);
-            vst1q_s32(dst,     vaddq_s32(vcombine_s32(vshrn_n_s64(q0, 15),
-                                                      vshrn_n_s64(q1, 15)), vshift));
-            vst1q_s32(dst + 4, vaddq_s32(vcombine_s32(vshrn_n_s64(q2, 15),
-                                                      vshrn_n_s64(q3, 15)), vshift));
-            src += 8;
-            dst += 8;
-            n -= 8;
-        } while (n > 0);
+        if (scale != INT32_MIN) {
+            const int32x4_t factor = vdupq_n_s32(scale);
+            const int32x4_t offset = vdupq_n_s32(shift);
+            do {
+                int16x8_t values = vld1q_s16(src);
+                int32x4_t low = vshll_n_s16(vget_low_s16(values), 16);
+                int32x4_t high = vshll_high_n_s16(values, 16);
+                vst1q_s32(dst, vaddq_s32(vqdmulhq_s32(low, factor), offset));
+                vst1q_s32(dst + 4, vaddq_s32(vqdmulhq_s32(high, factor), offset));
+                src += 8;
+                dst += 8;
+                n -= 8;
+            } while (n > 0);
+        } else {
+            const int32x2_t wr = vdup_n_s32(scale);
+            const int32x4_t vshift = vdupq_n_s32(shift);
+            do {
+                int16x8_t s = vld1q_s16(src);
+                int32x4_t s_lo = vmovl_s16(vget_low_s16(s));
+                int32x4_t s_hi = vmovl_s16(vget_high_s16(s));
+                int64x2_t q0 = vmull_s32(vget_low_s32(s_lo),  wr);
+                int64x2_t q1 = vmull_s32(vget_high_s32(s_lo), wr);
+                int64x2_t q2 = vmull_s32(vget_low_s32(s_hi),  wr);
+                int64x2_t q3 = vmull_s32(vget_high_s32(s_hi), wr);
+                vst1q_s32(dst,     vaddq_s32(vcombine_s32(vshrn_n_s64(q0, 15),
+                                                          vshrn_n_s64(q1, 15)), vshift));
+                vst1q_s32(dst + 4, vaddq_s32(vcombine_s32(vshrn_n_s64(q2, 15),
+                                                          vshrn_n_s64(q3, 15)), vshift));
+                src += 8;
+                dst += 8;
+                n -= 8;
+            } while (n > 0);
+        }
 #else
         do {
             for (int j = 0; j < 8; j++) {

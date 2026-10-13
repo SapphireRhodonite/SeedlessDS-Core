@@ -93,6 +93,7 @@ void nds_control_end(void)
     state.paused = 0;
     state.target = 0;
     pthread_mutex_unlock(&control_mutex);
+    input_pause_notify();
 }
 
 void nds_control_status(nds_control_status_t *out)
@@ -136,6 +137,7 @@ void nds_control_pause(int paused)
     if (!paused) state.paused = 0;
     __atomic_store_n(&pause_requested, paused != 0, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&control_mutex);
+    if (!paused) input_pause_notify();
 }
 
 int nds_control_run_to(uint64_t frame)
@@ -148,6 +150,7 @@ int nds_control_run_to(uint64_t frame)
         __atomic_store_n(&pause_requested, 0, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&control_mutex);
+    if (ok) input_pause_notify();
     return ok;
 }
 
@@ -163,6 +166,7 @@ int nds_control_step(uint64_t frames)
         __atomic_store_n(&pause_requested, 0, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&control_mutex);
+    if (ok) input_pause_notify();
     return ok;
 }
 

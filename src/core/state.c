@@ -159,6 +159,7 @@ void state_read_memory_blocks_finish(bus_t *bus);
 
 void state_read_machine_blocks(uint8_t *machine, uint8_t *stream, uint32_t mode)
 {
+    gpu3d_raster_frame_finish_pending();
 
     nds_runtime_t *runtime = &((nds_t *)machine)->runtime;
     arm_t *arm9 = &((nds_t *)machine)->arm9;
@@ -273,6 +274,7 @@ void state_read_machine_blocks(uint8_t *machine, uint8_t *stream, uint32_t mode)
 
 
 void state_write_machine_blocks(uint8_t *machine, uint8_t *stream, uint32_t mode) {
+    gpu3d_raster_frame_finish_pending();
     bus_t *bus = &((nds_t *)machine)->bus;
     uint8_t *section;
 

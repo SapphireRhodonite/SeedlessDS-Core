@@ -216,28 +216,33 @@ void spu_mixer_accumulate_pair(int16_t *dst, int32_t *acc, const int16_t *coef,
 #ifdef __ARM_NEON
 
     {
-        const int16_t *pc = coef;
-        const int32_t *ac = acc;
-        const int16_t *p5 = (const int16_t *)(acc + off);
-        int16_t *pd = dst;
-        int32_t k = n;
+        const int16_t *steps = (const int16_t *)(acc + off);
         do {
-            int16x8_t   c   = vld1q_s16(pc); pc += 8;
-            int32x4x2_t a01 = vld2q_s32(ac); ac += 8;
-            int16x8x2_t b   = vld2q_s16(p5); p5 += 16;
-            int32x4x2_t a23 = vld2q_s32(ac); ac += 8;
-            int16x8x2_t o;
+            int16x8_t c = vld1q_s16(coef);
+            int16x8_t low = vzip1q_s16(c, c);
+            int16x8_t high = vzip2q_s16(c, c);
+            int16x8_t s0 = vld1q_s16(steps);
+            int16x8_t s1 = vld1q_s16(steps + 8);
+            int32x4_t a0 = vld1q_s32(acc);
+            int32x4_t a1 = vld1q_s32(acc + 4);
+            int32x4_t a2 = vld1q_s32(acc + 8);
+            int32x4_t a3 = vld1q_s32(acc + 12);
 
-            int32x4_t v1 = vmlal_s16(a01.val[0], vget_low_s16(b.val[0]), vget_low_s16(c));
-            int32x4_t v2 = vmlal_s16(a01.val[1], vget_low_s16(b.val[1]), vget_low_s16(c));
-            int32x4_t v3 = vmlal_high_s16(a23.val[0], b.val[0], c);
-            int32x4_t v4 = vmlal_high_s16(a23.val[1], b.val[1], c);
+            a0 = vmlal_s16(a0, vget_low_s16(s0), vget_low_s16(low));
+            a1 = vmlal_high_s16(a1, s0, low);
+            a2 = vmlal_s16(a2, vget_low_s16(s1), vget_low_s16(high));
+            a3 = vmlal_high_s16(a3, s1, high);
 
-            o.val[0] = vshrq_n_s16(vcombine_s16(vshrn_n_s32(v1, 16), vshrn_n_s32(v3, 16)), 3);
-            o.val[1] = vshrq_n_s16(vcombine_s16(vshrn_n_s32(v2, 16), vshrn_n_s32(v4, 16)), 3);
-            vst2q_s16(pd, o); pd += 16;
-            k -= 8;
-        } while (k > 0);
+            int16x8_t out0 = vcombine_s16(vshrn_n_s32(a0, 16), vshrn_n_s32(a1, 16));
+            int16x8_t out1 = vcombine_s16(vshrn_n_s32(a2, 16), vshrn_n_s32(a3, 16));
+            vst1q_s16(dst, vshrq_n_s16(out0, 3));
+            vst1q_s16(dst + 8, vshrq_n_s16(out1, 3));
+            coef += 8;
+            steps += 16;
+            acc += 16;
+            dst += 16;
+            n -= 8;
+        } while (n > 0);
         return;
     }
 #else

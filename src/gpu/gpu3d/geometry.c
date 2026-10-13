@@ -691,10 +691,14 @@ static int32_t prod(uint32_t a, int32_t b) {
     return (int32_t)((uint32_t)(int32_t)a * (uint32_t)b);
 }
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#else
 static uint32_t comp(uint32_t v, uint32_t shift) {
     if ((v >> 19) != 0) return 0x1fu << shift;
     return ((v >> 14) & 0x1fu) << shift;
 }
+#endif
 
 void gpu3d_geometry_apply_lighting(gpu3d_t *ctx) {
 
@@ -724,6 +728,8 @@ void gpu3d_geometry_apply_lighting(gpu3d_t *ctx) {
         uint32_t emis1 = ctx->ambient_accum[1];
         uint32_t emis2 = ctx->ambient_accum[2];
         uint32_t mask = ctx->light_mask;
+        uint32_t first_light = mask ? (uint32_t)__builtin_ctz(mask) : 0;
+        mask >>= first_light;
         uint32_t with_table = ctx->shininess_enabled;
 
         int64_t m[9];
@@ -735,7 +741,11 @@ void gpu3d_geometry_apply_lighting(gpu3d_t *ctx) {
         m[8] = (int32_t)rd32(mz + 40);
 
         for (uint32_t i = 0; i < n_a; i++) {
+#ifdef __ARM_NEON
+            uint32x4_t color = {emis0, emis1, emis2, 0};
+#else
             uint32_t c0 = emis0, c1 = emis1, c2 = emis2;
+#endif
             if (mask != 0) {
                 uint32_t v = ctx->batch_normal[i];
                 int64_t nx = (int64_t)(int32_t)(v << 22) >> 22;
@@ -750,7 +760,7 @@ void gpu3d_geometry_apply_lighting(gpu3d_t *ctx) {
                     ((uint64_t)(nx * m[2] + ny * m[5] + nz * m[8]) >> 12);
 
                 uint32_t mm = mask;
-                for (uint32_t j = 0;; j++) {
+                for (uint32_t j = first_light;; j++) {
                     if (mm & 1) {
                         const uint8_t *ld = (const uint8_t *)ctx->light_direction[j];
                         const uint8_t *lh = (const uint8_t *)ctx->light_half_vector[j];
@@ -778,18 +788,33 @@ void gpu3d_geometry_apply_lighting(gpu3d_t *ctx) {
 
                         const uint8_t *cd = (const uint8_t *)ctx->light_diffuse[j];
                         const uint8_t *ce = (const uint8_t *)ctx->light_specular[j];
+#ifdef __ARM_NEON
+                        uint16x4_t diffuse = vdup_n_u16(0);
+                        uint16x4_t specular = vdup_n_u16(0);
+                        memcpy(&diffuse, cd, 6);
+                        memcpy(&specular, ce, 6);
+                        color = vmlaq_n_u32(color, vmovl_u16(diffuse), (uint32_t)diff);
+                        color = vmlaq_n_u32(color, vmovl_u16(specular), br);
+#else
                         c0 += (uint32_t)diff * rd16(cd);
                         c1 += (uint32_t)diff * rd16(cd + 2);
                         c2 += (uint32_t)diff * rd16(cd + 4);
                         c0 += br * rd16(ce);
                         c1 += br * rd16(ce + 2);
                         c2 += br * rd16(ce + 4);
+#endif
                     }
                     mm >>= 1;
                     if (mm == 0) break;
                 }
             }
+#ifdef __ARM_NEON
+            color = vminq_u32(vshrq_n_u32(color, 14), vdupq_n_u32(31));
+            color = vshlq_u32(color, (int32x4_t){0, 5, 10, 0});
+            calc[i] = (uint16_t)vaddvq_u32(color);
+#else
             calc[i] = (uint16_t)(comp(c0, 0) | comp(c1, 5) | comp(c2, 10));
+#endif
         }
     }
 

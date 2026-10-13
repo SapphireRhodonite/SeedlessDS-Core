@@ -753,7 +753,7 @@ int db_load_cheat_index(cheats_t *obj, const char *path) {
     cheat_index_entry_t *arr = (cheat_index_entry_t *)core_malloc((size_t)n * sizeof(cheat_index_entry_t));
     obj->index = arr;
 
-    core_fseek(f, 0, 0);
+    core_fseek(f, 256, 0);
     core_fread(prev, 4, 4, f);
 
     for (uint64_t i = 0; i < (uint64_t)n; i++) {

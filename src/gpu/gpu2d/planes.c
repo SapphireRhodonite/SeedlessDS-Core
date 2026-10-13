@@ -1,5 +1,8 @@
 #include <stdint.h>
 #include <string.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #include "hires_runtime.h"
 #include "blob_symbols.h"
 #include "mem_access.h"
@@ -1528,12 +1531,47 @@ const unsigned char gpu2d_lane_bit_masks[16] = {
 
 static unsigned umin(unsigned x, unsigned y) { return x < y ? x : y; }
 
+#ifdef __ARM_NEON
+static __attribute__((noinline)) int expand_mask_params_simd(
+    uint8_t *table_a, uint8_t *table_b, const uint16_t *bits,
+    uint8_t a, uint8_t b)
+{
+    uintptr_t aa = (uintptr_t)table_a, bb = (uintptr_t)table_b;
+    uintptr_t source = (uintptr_t)bits;
+    if ((aa >= bb ? aa - bb < 256u : bb - aa < 256u) ||
+        (aa >= source ? aa - source < 32u : source - aa < 256u) ||
+        (bb >= source ? bb - source < 32u : source - bb < 256u))
+        return 0;
+
+    const uint8x16_t lanes = vld1q_u8(gpu2d_lane_bit_masks);
+    const uint8x16_t va = vdupq_n_u8(a), vb = vdupq_n_u8(b);
+    const uint8x16_t limit = vdupq_n_u8(32);
+    const uint8x16_t byte_indices = {0, 0, 0, 0, 0, 0, 0, 0,
+                                   1, 1, 1, 1, 1, 1, 1, 1};
+    for (int i = 0; i < 16; i++) {
+        uint16_t word;
+        __builtin_memcpy(&word, bits + i, sizeof(word));
+        uint8x16_t replicated = vqtbl1q_u8(
+            vreinterpretq_u8_u16(vdupq_n_u16(word)), byte_indices);
+        uint8x16_t selected = vtstq_u8(replicated, lanes);
+        vst1q_u8(table_b + i * 16, vandq_u8(selected, vb));
+        vst1q_u8(table_a + i * 16, vbslq_u8(selected, va, limit));
+    }
+    return 1;
+}
+#endif
+
 void gpu2d_planes_expand_mask_to_params(int arg, uint8_t *table_a, uint8_t *table_b,
                         const uint16_t *bits) {
 
     unsigned p = (unsigned)arg + (unsigned)arg;
     unsigned a = umin(p & 0x3f, LIMIT);
     unsigned b = umin((p >> 8) & 0x3f, LIMIT);
+
+#ifdef __ARM_NEON
+    if (expand_mask_params_simd(table_a, table_b, bits, (uint8_t)a, (uint8_t)b))
+        return;
+#endif
 
     for (int i = 0; i < WIDTH; i++) {
         int is_set = (bits[i >> 4] >> (i & 15)) & 1;

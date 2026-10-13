@@ -18,9 +18,21 @@ __attribute__((weak)) int recon_dynamic_share(void) { return recon_scale_3d > 2u
 
 __attribute__((weak)) void recon_bands_set(void)
 {
+    unsigned height = 192u * recon_scale_3d;
     unsigned b = (recon_scale_3d > 2u) ? (unsigned)RECON_BANDS_DEFAULT : 12u;
+    if (b == 24u) {
+        for (unsigned bands = 32u; bands <= RECON_BAND_CAPACITY; bands += 16u) {
+            unsigned rows = height / bands;
+            unsigned tag_bytes = rows * RECON_3D_WIDTH;
+            if (tag_bytes < 0x4000u) tag_bytes = 0x4000u;
+            if (height % bands == 0u && rows % 8u == 0u
+                && tag_bytes % RECON_3D_WIDTH == 0u
+                && tag_bytes + rows / 8u <= RECON_PLANE2_SIZE)
+                b = bands;
+        }
+    }
     recon_bands_3d = b;
-    recon_band_rows = 192u * recon_scale_3d / b;
+    recon_band_rows = height / b;
 }
 
 void recon_set_scale(unsigned n, int native)

@@ -103,6 +103,7 @@ extern void    gpu2d_worker_shutdown(void);
 
 void mirror_fatal_reset_longjmp(unsigned char *param_1)
 {
+    gpu3d_raster_frame_finish_pending();
 
     if (((nds_t *)param_1)->runtime.jit_enabled == 0) {
         arm_hook_noop();
@@ -582,6 +583,7 @@ typedef int (*fn_munmap_13)(void *, uint64_t);
 typedef int (*fn_close_13)(int);
 
 int32_t mirror_memory_subsystem_destroy(uint8_t *param_1) {
+    gpu3d_raster_frame_finish_pending();
 
     static fn_munmap_13 p_munmap;
     static fn_close_13  p_close;
@@ -705,6 +707,7 @@ static void refresh_subset(bus_t *bus) {
 }
 
 void mem_console_reset(uint8_t *param_1) {
+    gpu3d_raster_frame_finish_pending();
 
     uint8_t *ctx = param_1;
     bus_t *bus = (bus_t *)param_1;
