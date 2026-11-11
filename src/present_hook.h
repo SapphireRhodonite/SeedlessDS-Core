@@ -20,5 +20,10 @@ void recon_present_set_fbo_dest(unsigned fbo);
 extern void *(*recon_pages_reserve)(unsigned long size);
 
 unsigned recon_page_list(void);
+extern uint64_t recon_output_page_token[2];
+extern __thread uint64_t recon_output_render_token;
+void recon_output_publish_page(unsigned page);
+void recon_output_sample_input(void);
+int recon_wait_output_phase(uint64_t work_us, uint64_t nominal_wait_us, uint32_t nominal_debt_ticks, int allow_overlap);
 
 #endif

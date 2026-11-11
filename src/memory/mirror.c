@@ -1,3 +1,4 @@
+#include "wifi/wifi_core.h"
 #include <stdint.h>
 #include "hires_runtime.h"
 #include "blob_symbols.h"
@@ -559,6 +560,7 @@ int32_t mirror_memory_subsystem_create(uint8_t *param_1, uint8_t *param_2) {
         }
     }
 
+    wifi_core_prepare_firmware(bus->firmware_image);
     bus->slot2_rom = 0;
     wr64(ctx + BUS_SLOT2_PAGE_BITS_OFF, 0);
     wr64(ctx + BUS_SLOT2_CODE_BITS_OFF, 0);

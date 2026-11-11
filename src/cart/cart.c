@@ -713,7 +713,7 @@ void cart_command_execute(cart_t *ctx, uint32_t arg) {
     }
     uint8_t stack[8];
     const uint8_t *order;
-    if (ctx->key1_active == 0) {
+    if (ctx->rom == NULL || ctx->key1_active == 0) {
         order = cart->cart.command;
     } else {
         const uint32_t *k = ctx->key1_table;
@@ -739,7 +739,10 @@ void cart_command_execute(cart_t *ctx, uint32_t arg) {
     }
     uint32_t mark = base | 0x800000u;
     uint32_t op = order[0];
-    if (op < COMMANDS) switch (op) {
+    if (ctx->rom == NULL) {
+        ctx->transfer_mode = 0;
+        ctx->data_word = 0xffffffffu;
+    } else if (op < COMMANDS) switch (op) {
     case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
     case 0x16: case 0x17: case 0x18: case 0x19: case 0x1a: case 0x1b:
     case 0x1c: case 0x1d: case 0x1e: case 0x1f: case 0x90: case 0xb8:

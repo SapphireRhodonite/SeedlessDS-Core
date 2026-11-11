@@ -920,28 +920,34 @@ int gpu2d_compose_fold_alpha_summary(uint8_t *dest, const void *origin) {
                                1, 2, 4, 8, 16, 32, 64, 128};
     uint8x16_t any = vdupq_n_u8(0);
     uint8x16_t partial = vdupq_n_u8(0);
-    for (unsigned i = 0; i < 16; ++i) {
-        const uint8_t *src = (const uint8_t *)origin + i * 64u;
-        uint8x16_t rgba0 = vld1q_u8(src);
-        uint8x16_t rgba1 = vld1q_u8(src + 16);
-        uint8x16_t rgba2 = vld1q_u8(src + 32);
-        uint8x16_t rgba3 = vld1q_u8(src + 48);
-        uint16x8_t low = vuzp2q_u16(vreinterpretq_u16_u8(rgba0),
-                                   vreinterpretq_u16_u8(rgba1));
-        uint16x8_t high = vuzp2q_u16(vreinterpretq_u16_u8(rgba2),
-                                    vreinterpretq_u16_u8(rgba3));
-        uint8x16_t alpha = vuzp2q_u8(vreinterpretq_u8_u16(low),
-                                    vreinterpretq_u8_u16(high));
-        uint8x16_t present = vmvnq_u8(vceqzq_u8(alpha));
-        any = vorrq_u8(any, present);
-        partial = vorrq_u8(partial,
-            vbicq_u8(present, vceqq_u8(alpha, vdupq_n_u8(31))));
-        uint8x16_t packed = vandq_u8(present, weights);
-        packed = vpaddq_u8(packed, packed);
-        packed = vpaddq_u8(packed, packed);
-        packed = vpaddq_u8(packed, packed);
-        uint16_t bits = vgetq_lane_u16(vreinterpretq_u16_u8(packed), 0);
-        memcpy(summary + i * 2u, &bits, sizeof(bits));
+#pragma clang loop unroll(disable)
+    for (unsigned i = 0; i < 4; ++i) {
+        uint8x16_t packed[4];
+#pragma clang loop unroll(full)
+        for (unsigned j = 0; j < 4; ++j) {
+            const uint8_t *src = (const uint8_t *)origin + i * 256u + j * 64u;
+            uint8x16_t rgba0 = vld1q_u8(src);
+            uint8x16_t rgba1 = vld1q_u8(src + 16);
+            uint8x16_t rgba2 = vld1q_u8(src + 32);
+            uint8x16_t rgba3 = vld1q_u8(src + 48);
+            uint16x8_t low = vuzp2q_u16(vreinterpretq_u16_u8(rgba0),
+                                       vreinterpretq_u16_u8(rgba1));
+            uint16x8_t high = vuzp2q_u16(vreinterpretq_u16_u8(rgba2),
+                                        vreinterpretq_u16_u8(rgba3));
+            uint8x16_t alpha = vuzp2q_u8(vreinterpretq_u8_u16(low),
+                                        vreinterpretq_u8_u16(high));
+            uint8x16_t present = vmvnq_u8(vceqzq_u8(alpha));
+            any = vorrq_u8(any, present);
+            partial = vorrq_u8(partial,
+                vbicq_u8(present, vceqq_u8(alpha, vdupq_n_u8(31))));
+            packed[j] = vandq_u8(present, weights);
+        }
+        uint8x16_t pairs0 = vpaddq_u8(packed[0], packed[1]);
+        uint8x16_t pairs1 = vpaddq_u8(packed[2], packed[3]);
+        pairs0 = vpaddq_u8(pairs0, pairs1);
+        pairs0 = vpaddq_u8(pairs0, pairs0);
+        uint64_t bits = vgetq_lane_u64(vreinterpretq_u64_u8(pairs0), 0);
+        memcpy(summary + i * 8u, &bits, sizeof(bits));
     }
     memcpy(dest, summary, sizeof(summary));
     if (vmaxvq_u8(partial) != 0) return 2;
@@ -1223,7 +1229,7 @@ void gpu2d_compose_blend_line_windows(uint8_t *ctx, uint8_t *dst, uint8_t *w, vo
                    & rd32(w + 7008 + (size_t)i * 4);
         for (uint32_t i = 0; i < 8; i++) wr32(output + (size_t)i * 4, res[i]);
 
-        if (p5 != 0 && !(sel & 0x80u)) {
+        if (p5 != 0 && (!(sel & 0x80u) || !(band & 8u))) {
             for (uint32_t i = 0; i < 8; i++) {
                 uint32_t t = rd32(w + 7008 + (size_t)i * 4)
                            & rd32(w + 5056 + (size_t)i * 4);
@@ -2073,11 +2079,20 @@ L_tail:
 
 static void recon_tbl64(uint8_t out[16], const uint8_t table[64], const uint8_t idx[16])
 {
+#ifdef __ARM_NEON
+    uint8x16x4_t values;
+    values.val[0] = vld1q_u8(table);
+    values.val[1] = vld1q_u8(table + 16);
+    values.val[2] = vld1q_u8(table + 32);
+    values.val[3] = vld1q_u8(table + 48);
+    vst1q_u8(out, vqtbl4q_u8(values, vld1q_u8(idx)));
+#else
     int i;
     for (i = 0; i < 16; i++) {
         uint8_t j = idx[i];
         out[i] = (j < 64u) ? table[j] : 0u;
     }
+#endif
 }
 
 static void recon_xor16(uint8_t buf[16], uint8_t key)
@@ -2088,11 +2103,18 @@ static void recon_xor16(uint8_t buf[16], uint8_t key)
 
 static void recon_store_pairs(uint8_t *dst, const uint8_t color[16], uint8_t pal)
 {
+#ifdef __ARM_NEON
+    uint8x16x2_t values;
+    values.val[0] = vld1q_u8(color);
+    values.val[1] = vdupq_n_u8(pal);
+    vst2q_u8(dst, values);
+#else
     int i;
     for (i = 0; i < 16; i++) {
         dst[2 * i]     = color[i];
         dst[2 * i + 1] = pal;
     }
+#endif
 }
 
 void gpu2d_compose_decode_bg_row_8bpp_paletted(uint8_t *x0, uint8_t *x1, uint8_t *x2, uint8_t *x3,
@@ -2763,6 +2785,24 @@ void gpu2d_compose_extract_alpha_plane_bf00(const unsigned char *pl, unsigned ch
 void gpu2d_compose_extract_alpha_plane_bf60(const unsigned char *a, const unsigned char *b,
                              unsigned char *dst) {
 #ifdef __ARM_NEON
+    if (a == b) {
+        unsigned g;
+        uint8x16_t al = vld1q_u8(ALPHA_4H);
+        for (g = 0; g < 16; g++) {
+            uint8x16_t a0 = vshlq_n_u8(vld1q_u8(a + 0 * PLANE_B), 2);
+            uint8x16_t a1 = vshlq_n_u8(vld1q_u8(a + 1 * PLANE_B), 2);
+            uint8x16_t a2 = vshlq_n_u8(vld1q_u8(a + 2 * PLANE_B), 2);
+            uint8x16x4_t lo, hi;
+            lo.val[0] = vzip1q_u8(a0, a0); hi.val[0] = vzip2q_u8(a0, a0);
+            lo.val[1] = vzip1q_u8(a1, a1); hi.val[1] = vzip2q_u8(a1, a1);
+            lo.val[2] = vzip1q_u8(a2, a2); hi.val[2] = vzip2q_u8(a2, a2);
+            lo.val[3] = al;                hi.val[3] = al;
+            vst4q_u8(dst, lo);
+            vst4q_u8(dst + 64, hi);
+            a += 16; dst += 128;
+        }
+        return;
+    }
 
     {
         unsigned g;

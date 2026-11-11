@@ -67,6 +67,10 @@ void cheats_run_codes(uint8_t *machine, cheat_entry_t *descriptor, uint32_t mask
         group = op >> 28;
         address = op & 0x0fffffffu;
 
+        if ((history & 1u) == 0 && group != 14 &&
+            op != 0xd0000000u && op != 0xd1000000u && op != 0xd2000000u)
+            continue;
+
         switch (group) {
         case 0:
             address += accumulated;
@@ -198,14 +202,14 @@ void cheats_run_codes(uint8_t *machine, cheat_entry_t *descriptor, uint32_t mask
 
             switch (subgroup) {
             case 0:
-                accumulated = value;
+                history >>= (value == 0);
                 break;
 
             case 1:
                 if (value != 0)
                     break;
                 repeat--;
-                if (repeat == 0)
+                if ((int32_t)repeat <= 0)
                     history = history_saved;
                 else
                     pc = pc_saved;
@@ -215,7 +219,7 @@ void cheats_run_codes(uint8_t *machine, cheat_entry_t *descriptor, uint32_t mask
                 if (value != 0)
                     break;
                 repeat--;
-                if (repeat == 0) {
+                if ((int32_t)repeat <= 0) {
                     accumulated = 0;
                     value_current = 0;
                     history = UINT32_MAX;
@@ -311,10 +315,6 @@ void cheats_run_codes(uint8_t *machine, cheat_entry_t *descriptor, uint32_t mask
             break;
 
         case 14:
-            history >>= (value == 0);
-            break;
-
-        case 15:
             if ((history & 1u) != 0 && value != 0) {
                 uint32_t dest = address + accumulated;
                 uint32_t left = value;
@@ -340,6 +340,26 @@ void cheats_run_codes(uint8_t *machine, cheat_entry_t *descriptor, uint32_t mask
                 } while (--left != 0);
             }
             pc += (uint64_t)(((value + 7u) >> 2) & 0x3ffffffeu) << 2;
+            break;
+
+        case 15:
+            for (uint32_t left = value; left != 0; left--) {
+                uint8_t byte = (uint8_t)bus_read8(pages, accumulated);
+
+                page = entry_page(machine, address);
+                base = base_page(page);
+                if ((page & (UINT64_C(1) << 62)) == 0) {
+                    wr8(base + address, byte);
+                } else if ((page & (UINT64_C(1) << 63)) == 0) {
+                    bus_write8_slow(pages, address, byte);
+                } else if (rd8(base + address) != byte) {
+                    if (jit_watch_write8(notifier, address) == 0)
+                        notices++;
+                    wr8(base + address, byte);
+                }
+                accumulated++;
+                address++;
+            }
             break;
         }
     }

@@ -14,7 +14,7 @@ int recon_app_scale(unsigned *n, int *native)
     return recon_app_present;
 }
 
-__attribute__((weak)) int recon_dynamic_share(void) { return recon_scale_3d > 2u; }
+__attribute__((weak)) int recon_dynamic_share(void) { return recon_scale_3d > 1u; }
 
 __attribute__((weak)) void recon_bands_set(void)
 {

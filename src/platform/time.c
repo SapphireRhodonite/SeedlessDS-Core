@@ -1,8 +1,15 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 #include "hires_runtime.h"
 #include "blob_symbols.h"
 #include "seedlessds/platform.h"
+
+uint64_t time_monotonic_microseconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
+}
 
 void time_now_microseconds(uint64_t *dest) {
 

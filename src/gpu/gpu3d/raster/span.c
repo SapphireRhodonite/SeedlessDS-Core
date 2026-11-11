@@ -728,12 +728,12 @@ void gpu3d_raster_span_edge_ramp_dispatch_hires(uint8_t *param_1, const gpu3d_po
                 uint32_t bb = rb & 0x7fffu;
                 if (bb >= aa) {
 
-                    if ((rb & (0x8000u | RECON_3D_WIDTH)) == 0)
+                    if ((rb & 0x8000u) == 0 && bb < RECON_3D_WIDTH)
                         ++bb;
                     wr16(a, (uint16_t)aa);
                     wr16(b, (uint16_t)bb);
                 } else {
-                    if ((ra & (0x8000u | RECON_3D_WIDTH)) == 0)
+                    if ((ra & 0x8000u) == 0 && aa < RECON_3D_WIDTH)
                         ++aa;
                     wr16(a, (uint16_t)aa);
                     wr16(b, (uint16_t)bb);

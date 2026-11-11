@@ -33,6 +33,9 @@ int io_reg_read_returns_zero(long a0, long a1, long a2, long a3, long a4, long a
 unsigned int io_read_port16(const uint8_t *state, unsigned int dir);
 int io_read32_unmapped_zero(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7);
 void io_write_port16(unsigned char *state, uint32_t dir, uint32_t value);
+uint32_t io_wifi_read8(const uint8_t *state, uint32_t address);
+uint32_t io_wifi_read32(const uint8_t *state, uint32_t address);
+void io_wifi_write32(uint8_t *state, uint32_t address, uint32_t value);
 int io_slot2_open_bus_read32(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7);
 uint32_t io_slot2_serial_read32_pop_pair(uint8_t *ctx);
 unsigned int io_slot2_open_bus_read16(void);

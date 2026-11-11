@@ -8,6 +8,7 @@
 #include "core/nds_state.h"
 #include "frontend/frontend.h"
 #include "core_internals.h"
+#include "wifi/wifi_core.h"
 
 
 #define FRONTEND_BOOT_KEY UINT64_C(0x1AB10BF4DBBE1F0F)
@@ -198,6 +199,7 @@ void nds_wait_screen(nds_t *nds)
 
 int nds_state_save(nds_t *nds, int slot)
 {
+    if (wifi_core_active()) return -1;
     (void)nds;
     frontend_t *g = FRONTEND;
     g->state_slot = (uint8_t)slot;
@@ -207,6 +209,7 @@ int nds_state_save(nds_t *nds, int slot)
 
 int nds_state_load(nds_t *nds, int slot)
 {
+    if (wifi_core_active()) return -1;
     (void)nds;
     frontend_t *g = FRONTEND;
     g->lid_closed = 0;
@@ -241,11 +244,13 @@ void nds_input_set(nds_t *nds, const nds_input_t *input)
 {
     (void)nds;
     frontend_t *g = FRONTEND;
+    input_state_lock();
     g->buttons = input->keys;
     g->buttons_mask = input->keys_mask;
     g->touch_down = (uint8_t)(input->touch_down != 0);
     g->touch_x = (uint32_t)input->touch_x;
     g->touch_y = (uint32_t)input->touch_y;
+    input_state_unlock();
 }
 
 void nds_accel(nds_t *nds, float x, float y, float z)

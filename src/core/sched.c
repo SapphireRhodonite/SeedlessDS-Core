@@ -6,6 +6,7 @@
 #include "core/sched.h"
 #include "core_internals.h"
 #include "mem_access.h"
+#include "wifi/wifi_core.h"
 
 
 const int32_t bus_cost_same_region[64] = {
@@ -100,6 +101,8 @@ void sched_deadline_set(sched_t *base, uint32_t idx,
 
 void *sched_init(sched_t *obj, unsigned char *ctx) {
 
+    obj->vcount_pending = 0;
+
     obj->deadline[SCHED_DEADLINE_SCANLINE].index = SCHED_DEADLINE_SCANLINE;
     obj->deadline[SCHED_DEADLINE_CYCLE_EVENT].index = SCHED_DEADLINE_CYCLE_EVENT;
 
@@ -139,6 +142,13 @@ static void mask_b(arm_t *cpu, uint32_t bit) {
                          & (uint32_t)(-(int32_t)reg->irq.ime);
 }
 
+void sched_write_vcount(sched_t *sched, uint16_t value, uint16_t mask) {
+    if (sched->scanline < 202 || sched->scanline > 212) return;
+    uint16_t previous = sched->vcount_pending ? sched->vcount_pending : sched->scanline;
+    uint16_t next = ((previous & ~mask) | (value & mask)) & 0x1ffu;
+    if (next >= 202 && next <= 212) sched->vcount_pending = next;
+}
+
 void sched_scanline_event(void *machine, void *argument) {
     (void)argument;
 
@@ -149,19 +159,24 @@ void sched_scanline_event(void *machine, void *argument) {
     arm_t *iA  = &((nds_t *)machine)->arm9;
 
     sched_t *sched = &((nds_t *)machine)->sched;
+    uint64_t vblank_edge = sched->scanline == 191 && wifi_core_active() ? time_monotonic_microseconds() : 0;
+    wifi_wm_poll();
     int32_t code = (int32_t)sched->scanline;
     uint32_t sig = (uint32_t)code + 1;
+    if (code > 0xd6) pacer_continue_wireless_wait(code == 0x106);
 
     uint64_t (*run_transfer)(dma_t *, dma_channel_t *) = dma_channel_run_transfer;
 
 
     if (code > 0x104) {
         if (code == 0x106) {
+            wifi_core_flush();
             gpu3d_raster_frame_finish_pending();
             for (int k = 0; k < 4; k++)
                 if (((int32_t)bus->dma[0].channels[k].cnt < 0)
                     && bus->dma[0].channels[k].start_mode == 3)
                     run_transfer(&bus->dma[0], &bus->dma[0].channels[k]);
+            if (wifi_core_active()) pacer_set_wireless_deadline(machine);
             gpu_frame_open((uint8_t *)&((nds_t *)machine)->gpu);
             sig = 0;
         } else if (code == 0x105) {
@@ -180,7 +195,9 @@ void sched_scanline_event(void *machine, void *argument) {
         *(uint8_t *)bB = (uint8_t)(v | 1);
         if (v & 8) mask_b(iB, 1);
 
+        wifi_core_flush();
         gpu_frame_close((uint8_t *)&((nds_t *)machine)->gpu);
+        pacer_wait_before_input(machine);
         input_record_end_of_frame((uint8_t *)&((nds_t *)machine)->input_record);
         benchmark_step((unsigned char *)&((nds_t *)machine)->benchmark);
         spi_memory_save_tick(&((nds_t *)machine)->cart.backup);
@@ -214,6 +231,7 @@ void sched_scanline_event(void *machine, void *argument) {
         sig = 0xc0;
     } else if (code == 0xd6) {
         unsigned char *p = &((nds_t *)machine)->gpu.engine[0].no_framebuffer;
+        wifi_core_flush();
         pacer_run(machine);
         uint32_t m = (uint8_t)((nds_t *)machine)->benchmark.pass_flags;
         uint32_t n = *(uint8_t *)p;
@@ -224,6 +242,11 @@ void sched_scanline_event(void *machine, void *argument) {
         } else
             gpu3d_raster_frame_thread_submit(dst, arg);
         sig = 0xd7;
+    }
+
+    if (sched->vcount_pending) {
+        sig = sched->vcount_pending;
+        sched->vcount_pending = 0;
     }
 
     uint32_t v = *(uint16_t *)bA;
@@ -249,8 +272,9 @@ void sched_scanline_event(void *machine, void *argument) {
     *(uint8_t *)bA &= 0xfd;
     *(uint8_t *)bB &= 0xfd;
 
-    sched_deadline_t *n = sched->head;
     sched->scanline = (uint16_t)sig;
+    if (vblank_edge) wifi_wm_vblank(vblank_edge);
+    sched_deadline_t *n = sched->head;
     sched_deadline_t *self = &sched->deadline[SCHED_DEADLINE_VBLANK];
 
     sched_deadline_t *prev = 0;

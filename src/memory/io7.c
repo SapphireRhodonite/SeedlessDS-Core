@@ -9,9 +9,23 @@
 #include <string.h>
 #include "core_internals.h"
 #include "mem_access.h"
+#include "wifi/wifi_core.h"
+
+static uint32_t wm_fifo_read(bus_t *bus)
+{
+    wifi_wm_poll();
+    if (wifi_wm_blocks()) {
+        if (bus->io_mirror[1].ipc.ipcfifocnt & 0x8000) bus->io_mirror[1].ipc.ipcfifocnt |= 0x4000;
+        return 0;
+    }
+    uint32_t value = ipc_fifo_recv(&bus->ipc_fifo[1]);
+    wifi_wm_poll();
+    return value;
+}
 
 uint32_t io7_read16(unsigned char *ctx, uint32_t dir) {
     bus_t *bus = (bus_t *)ctx;
+    if (dir == 0x184 && wifi_wm_blocks()) return (bus->io_mirror[1].ipc.ipcfifocnt & ~0x200u) | 0x100u;
     int32_t with_sign = (int32_t)dir;
 
     if (with_sign > 0x203) {
@@ -28,7 +42,7 @@ uint32_t io7_read16(unsigned char *ctx, uint32_t dir) {
             return base | 0x4000u;
         }
         if (dir != 0x100000) goto backup;
-        return ipc_fifo_recv(&((bus_t *)ctx)->ipc_fifo[1]);
+        return wm_fifo_read((bus_t *)ctx);
     }
 
     {
@@ -98,6 +112,7 @@ static uint32_t read_flat(const uint8_t *ctx, uint32_t dir) {
 uint32_t io7_read32(uint8_t *ctx, uint32_t dir) {
 
     bus_t *bus7 = (bus_t *)ctx;
+    if (dir == 0x184 && wifi_wm_blocks()) return (read_flat(ctx, dir) & ~0x200u) | 0x100u;
 
     if ((int32_t)dir <= 0x19f) {
         uint32_t k = dir - 0x100u;
@@ -139,7 +154,7 @@ uint32_t io7_read32(uint8_t *ctx, uint32_t dir) {
             return a | 0x4000u;
         }
 
-        if (dir == 0x100000) return ipc_fifo_recv(&((bus_t *)ctx)->ipc_fifo[1]);
+        if (dir == 0x100000) return wm_fifo_read((bus_t *)ctx);
 
         if (dir == 0x100010) return cart_data_in_next_word(((bus_t *)ctx)->cart);
         return read_flat(ctx, dir);
@@ -213,6 +228,11 @@ static void arm7_irq_raise(bus_t *param_1, io_mirror_t *mir7, uint32_t w9)
 
 void io7_write8(bus_t *param_1, uint32_t param_2, uint32_t param_3)
 {
+    if (param_2 == 0x304) {
+        tail_generic(param_1, param_2, param_3);
+        wifi_core_power(param_3);
+        return;
+    }
 
     bus_t *bus8 = (bus_t *)param_1;
 
@@ -253,7 +273,12 @@ void io7_write8(bus_t *param_1, uint32_t param_2, uint32_t param_3)
     io_mirror_t *mir7 = &((bus_t *)param_1)->io_mirror[1];
 
     if ((int32_t)param_2 <= 0x12f) {
-        if ((param_2 - 6u) < 2u) return;
+        if ((param_2 - 6u) < 2u) {
+            uint32_t shift = (param_2 & 1u) * 8u;
+            sched_write_vcount(&((nds_t *)bus8->machine)->sched,
+                (param_3 & 255u) << shift, 255u << shift);
+            return;
+        }
         if (param_2 != 4u) { tail_default(param_1, param_2, param_3); return; }
         uint8_t b = rd8(x22);
         param_3 = (param_3 & ~0x7u) | (b & 0x7u);
@@ -364,7 +389,7 @@ void io7_write8(bus_t *param_1, uint32_t param_2, uint32_t param_3)
         uint8_t prev  = rd8(x22 + 385);
         uint8_t byte3 = (uint8_t)(param_3 & 0xffu);
         if ((param_3 & 0x4u) != 0) {
-            if ((((bus_t *)param_1)->ipc_fifo[1].flags & IPC_FIFO_EMPTY) == 0) {
+            if ((((bus_t *)param_1)->ipc_fifo[1].flags & IPC_FIFO_EMPTY) == 0 && !wifi_wm_blocks()) {
                 pagetable_t *v1 = bus8->arm7_pagetable;
                 arm_t *ptrA = ((pagetable_t *)v1)->cpu;
                 io_mirror_t *ptrB = ((arm_t *)ptrA)->io_mirror;
@@ -405,7 +430,7 @@ void io7_write8(bus_t *param_1, uint32_t param_2, uint32_t param_3)
     case 0x1a2: {
         cart_t *base   = bus8->cart;
         uint16_t w20 = rd16(x23 + 32);
-        param_3 = spi_memory_transfer_byte
+        param_3 = base->rom == NULL ? 0xffu : spi_memory_transfer_byte
                       (&((cart_t *)base)->backup, param_3 & 0xffu);
         if ((w20 & 0x40u) == 0) {
             cart_t *base2 = bus8->cart;
@@ -572,6 +597,11 @@ void io7_write16(void *ctx, uint32_t reg, uint32_t val)
     io_mirror_t *mir7w16 = &((bus_t *)ctx)->io_mirror[1];
     uint32_t v16 = val & 0xffff;
 
+    if (reg == 6) {
+        sched_write_vcount(&((nds_t *)((bus_t *)ctx)->machine)->sched, v16, 0xffffu);
+        return;
+    }
+
     if (reg >= 0x400 && reg <= 0x4fe && !(reg & 1)) {
         spu_t *spu = ((bus_t *)c)->spu;
         uint32_t sel = reg & 0xfffff00f;
@@ -708,6 +738,10 @@ void io7_write16(void *ctx, uint32_t reg, uint32_t val)
 
         io7_write8(ctx, reg, val);
         io7_write8(ctx, reg + 1, (val >> 8) & 0xff);
+        return;
+    }
+    if (wifi_core_active()) {
+        wifi_core_write(reg, (uint16_t)val);
         return;
     }
     if ((reg & 0xc000) == 0x4000) {
@@ -848,7 +882,7 @@ void io7_write32(uint8_t *ctx, uint32_t dir, uint32_t val) {
     }
 
 window:
-    wr32((uint8_t *)busw->io_mirror + (dir & 0x7fffu), val);
+    wr32((uint8_t *)mir7w32 + (dir & 0x7fffu), val);
     return;
 
 backup:

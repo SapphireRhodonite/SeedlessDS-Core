@@ -654,7 +654,7 @@ void pagetable_dtcm_remap(bus_t *bus, uint32_t base, uint32_t len) {
             } else {
                 v = 0x4000000000000000ULL;
             }
-            *(uint64_t *)(table + (uint64_t)page * 8) = v;
+            *(uint64_t *)(table + (uint64_t)page * 8) = bus_main_ram_page_watch(table, p, v);
 
             p += 0x800;
             if (end_old == p)
@@ -808,7 +808,7 @@ void pagetable_itcm_resize(bus_t *bus, uint32_t updated_size) {
             } else {
                 v = 0x4000000000000000ULL;
             }
-            *(uint64_t *)(table + (uint64_t)page * 8) = v;
+            *(uint64_t *)(table + (uint64_t)page * 8) = bus_main_ram_page_watch(table, p, v);
 
             p += 0x800;
             if (old_size == p)

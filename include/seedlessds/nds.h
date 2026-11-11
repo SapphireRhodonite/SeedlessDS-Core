@@ -51,6 +51,7 @@ nds_t *nds_create(const nds_platform_t *platform, uint32_t api_level,
                   uint32_t script_overrides_high);
 void nds_destroy(nds_t *nds);
 int nds_load_rom(nds_t *nds, const nds_rom_open_t *open);
+int nds_load_firmware(nds_t *nds, uint64_t config_bits, uint64_t run_limit_us);
 int nds_insert_gba(nds_t *nds, const char *path, int state_slot, int in_cache_dir, uint64_t run_limit_us);
 void nds_reset(nds_t *nds);
 void nds_pause(nds_t *nds, int paused);
@@ -67,6 +68,8 @@ const char *nds_info_string(nds_t *nds, char *buffer, size_t size);
 #define NDS_ROM_ICON_PIXEL_BYTES 1024
 #define NDS_ROM_ICON_TITLE_BYTES 256
 
+#define NDS_CARTRIDGE_HEADER_BYTES 32
+int nds_rom_header(const char *path, const char *name, uint8_t header[NDS_CARTRIDGE_HEADER_BYTES]);
 int nds_rom_is_nds(const char *path);
 int nds_rom_type(const char *path);
 uint32_t nds_rom_size(const char *path);
@@ -82,6 +85,8 @@ int nds_screenshot(nds_t *nds, void *rgba, size_t size);
 void nds_clear_screens(nds_t *nds, uint32_t texture_top, uint32_t texture_bottom);
 void nds_signal_screen(nds_t *nds);
 void nds_wait_screen(nds_t *nds);
+void nds_request_screen_redraw(nds_t *nds);
+int nds_wait_screen_update(nds_t *nds);
 void nds_render_frame(nds_t *nds, uint32_t first, uint32_t second, int flag);
 void nds_draw_screen(nds_t *nds, uint32_t texture, uint32_t index);
 void nds_draw_screen_ext(nds_t *nds, uint32_t texture, uint32_t index);
@@ -101,6 +106,15 @@ int nds_state_slot(nds_t *nds);
 void nds_autosave_interval(nds_t *nds, unsigned seconds);
 
 void nds_input_set(nds_t *nds, const nds_input_t *input);
+void nds_set_early_input_pacing(nds_t *nds, int enabled);
+void nds_set_output_pacing(nds_t *nds, int enabled);
+void nds_record_output_ready(nds_t *nds, uint64_t token);
+void nds_complete_output_frame(nds_t *nds, uint64_t token, int consumed,
+                               uint64_t observed_token, uint64_t phase_ns, uint64_t rendered_token,
+                               uint64_t rendered_ns, uint64_t interval_ns, uint64_t buffer_released_ns,
+                               uint64_t completed_gpu_token);
+void nds_complete_output_gpu(nds_t *nds, uint64_t token, uint64_t completed_gpu_token);
+uint64_t nds_fx_frame_token(nds_t *nds);
 void nds_accel(nds_t *nds, float x, float y, float z);
 void nds_gyro(nds_t *nds, float x, float y, float z);
 uint32_t nds_rumble_state(nds_t *nds);

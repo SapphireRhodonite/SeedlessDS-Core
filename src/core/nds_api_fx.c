@@ -6,6 +6,7 @@
 #include "core/nds_state.h"
 #include "frontend/frontend.h"
 #include "core_internals.h"
+#include "present_hook.h"
 
 #define MAIN_RAM_BASE 0x02000000u
 #define MAIN_RAM_MASK 0x003fffffu
@@ -33,6 +34,7 @@ void nds_fx_setup(nds_t *nds, int source_width, int source_height, int x, int y,
 void nds_fx_render(nds_t *nds, const nds_fx_frame_t *frame)
 {
     (void)nds;
+    recon_output_render_token = 0;
     video_out_gl_render_frame(frame->texture_top,
                                                      frame->texture_bottom,
                                                      frame->vertex_top,

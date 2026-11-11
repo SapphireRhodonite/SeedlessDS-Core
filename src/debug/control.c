@@ -122,6 +122,15 @@ int nds_control_pause_requested(void)
     return __atomic_load_n(&pause_requested, __ATOMIC_ACQUIRE);
 }
 
+int nds_control_requires_fixed_pacing(void)
+{
+    if (!__atomic_load_n(&enabled, __ATOMIC_ACQUIRE)) return 0;
+    pthread_mutex_lock(&control_mutex);
+    int fixed = state.target != 0 || capture_fd >= 0 || audio_fd >= 0;
+    pthread_mutex_unlock(&control_mutex);
+    return fixed;
+}
+
 void nds_control_pause_acknowledge(int paused)
 {
     if (!__atomic_load_n(&enabled, __ATOMIC_ACQUIRE)) return;

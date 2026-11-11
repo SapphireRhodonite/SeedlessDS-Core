@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <pthread.h>
 #include "hires_runtime.h"
 #include "blob_symbols.h"
 #include "core/nds_state.h"
@@ -18,6 +19,17 @@
 #include "seedlessds/control.h"
 
 static uint32_t pause_generation;
+static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void input_state_lock(void)
+{
+    pthread_mutex_lock(&input_mutex);
+}
+
+void input_state_unlock(void)
+{
+    pthread_mutex_unlock(&input_mutex);
+}
 
 void input_pause_notify(void)
 {
@@ -47,9 +59,12 @@ uint64_t input_hook_noop(uint64_t x0)
 
 void input_state_reset(void) {
     frontend_t *g = FRONTEND;
-    *(volatile uint32_t *)&g->buttons      = 0;
-    *(volatile uint8_t  *)&g->touch_down   = 0;
-    *(volatile uint64_t *)&g->touch_x      = 0;
+    input_state_lock();
+    g->buttons = 0;
+    g->touch_down = 0;
+    g->touch_x = 0;
+    g->touch_y = 0;
+    input_state_unlock();
     *(volatile uint8_t  *)&g->accel_valid = 0;
     *(volatile uint8_t  *)&g->gyro_valid = 0;
 }
@@ -97,6 +112,7 @@ void input_poll_and_pause(uint8_t *ctx) {
     frontend_t *g = FRONTEND;
     uint8_t *dst = ctx + C_DST;
 
+    input_state_lock();
     if (ctx[C_MODE] != 2) {
         uint32_t bot = g->buttons;
         uint32_t masked = g->buttons_mask;
@@ -116,6 +132,7 @@ void input_poll_and_pause(uint8_t *ctx) {
 
     dst[12] = g->touch_down;
     memcpy(dst + 4, &g->touch_x, sizeof g->touch_x + sizeof g->touch_y);
+    input_state_unlock();
 
     uint32_t has = 0;
     if (g->accel_valid != 0) {

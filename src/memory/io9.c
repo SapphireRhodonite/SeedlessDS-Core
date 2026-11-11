@@ -1,3 +1,4 @@
+#include "wifi/wifi_core.h"
 #include <stdint.h>
 #include "hires_runtime.h"
 #include "blob_symbols.h"
@@ -402,7 +403,13 @@ void io9_write8(void *ctx, uint32_t reg, uint32_t val)
 
     switch (reg) {
 
-    case 0x006: case 0x007: case 0x130: case 0x131:
+    case 0x006: case 0x007: {
+        uint32_t shift = (reg & 1u) * 8u;
+        sched_write_vcount(&((nds_t *)bus->machine)->sched, v8 << shift, 255u << shift);
+        return;
+    }
+
+    case 0x130: case 0x131:
     case 0x180: case 0x1a3: case 0x209: case 0x20a: case 0x20b:
         return;
 
@@ -544,7 +551,7 @@ void io9_write8(void *ctx, uint32_t reg, uint32_t val)
         }
         val &= 4u;
 
-        if (v9 & 8) ipc_fifo_reset(&bus->ipc_fifo[1]);
+        if (v9 & 8) { ipc_fifo_reset(&bus->ipc_fifo[1]); wifi_wm_clear(); }
         r[384] = (uint8_t)((r[384] & ~4u) | val);
         return;
     }
@@ -581,7 +588,8 @@ void io9_write8(void *ctx, uint32_t reg, uint32_t val)
         uint32_t ctl = rd16(r + 412);
         uint8_t *b0 = rd_ptr_u8(bd);
 
-        uint32_t res = spi_memory_transfer_byte(&((cart_t *)b0)->backup, v8);
+        uint32_t res = ((cart_t *)b0)->rom == NULL ? 0xffu
+            : spi_memory_transfer_byte(&((cart_t *)b0)->backup, v8);
         if (!(ctl & 0x40))
 
             spi_memory_deselect(&((cart_t *)rd_ptr(bd))->backup);
@@ -680,13 +688,22 @@ static void dma_engine_4(uint8_t *g, uint32_t engine_idx, uint32_t reg, uint32_t
 
 void io9_write16(void *ctx, uint32_t reg, uint32_t val)
 {
+    bus_t *bus = (bus_t *)ctx;
+    if (reg == 0x60u && bus->gpu3d->disp3dcnt == (val & 0xcfffu)) {
+        wr16((uint8_t *)ctx + IO9_MIRROR + 0x60u, val & ~0x3000u);
+        return;
+    }
     finish_raster_before_write(reg, 2u);
     uint8_t *c  = (uint8_t *)ctx;
     uint8_t *g  = c;
-    bus_t *bus = (bus_t *)ctx;
     io_mirror_t *mir9w16 = &bus->io_mirror[0];
 
     uint32_t v16 = val & 0xffff;
+
+    if (reg == 6) {
+        sched_write_vcount(&((nds_t *)bus->machine)->sched, v16, 0xffffu);
+        return;
+    }
 
     if (reg > 0xfff) {
 
@@ -1163,6 +1180,7 @@ void io9_write32(void *param_1, uint32_t param_2, uint64_t param_3)
                 }
                 uint8_t *x21p = (uint8_t *)&bus->io_mirror[1].ipc.ipcfifocnt + 1;
                 ipc_fifo_push(&bus->ipc_fifo[1], w20);
+                wifi_wm_capture(w20);
 
                 uint8_t v21; memcpy(&v21, x21p, 1);
                 v21 &= 0xfeu;
@@ -1182,7 +1200,7 @@ void io9_write32(void *param_1, uint32_t param_2, uint64_t param_3)
                 if (v_1e6 & 1u) {
                     return;
                 }
-                if ((v21 & 4u) == 0u) {
+                if ((v21 & 4u) == 0u || wifi_wm_blocks()) {
                     return;
                 }
 

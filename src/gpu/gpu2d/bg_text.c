@@ -701,7 +701,8 @@ void gpu2d_bg_text_decode_indexed_line(gpu2d_bg_t *ctx, uint8_t *dest16, uint8_t
 
         if ((int32_t)first > (int32_t)last)
             return;
-        first &= ~(first >> 31);
+        if ((int32_t)first < 0)
+            first = 0;
         if ((int32_t)first > 255)
             return;
         if (last & 0x80000000U)

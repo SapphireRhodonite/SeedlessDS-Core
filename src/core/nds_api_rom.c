@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include "hires_runtime.h"
 #include "blob_symbols.h"
@@ -10,6 +11,8 @@
 #include "core/nds_start.h"
 #include "frontend/frontend.h"
 #include "core_internals.h"
+#include "seedlessds/multiplayer.h"
+#include "wifi/wifi_core.h"
 
 #define ROM_PATH_FORMAT_BYTES 0x400
 #define MAPS_DUMP_UNKNOWN 0
@@ -80,7 +83,9 @@ static void frontend_prepare(frontend_t *g, const nds_rom_open_t *open)
     g->lid_closed = 0;
     __atomic_store_n(&g->quit_request, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g->pause_request, 0, __ATOMIC_RELEASE);
+    input_state_lock();
     g->buttons = 0;
+    input_state_unlock();
     g->state_slot = 0;
     g->state_saving = 0;
     g->state_load_request = 0;
@@ -131,6 +136,28 @@ static void maps_dump_probe(frontend_t *g)
     }
 }
 
+static int firmware_file_has_size(const char *path, long size)
+{
+    FILE *file = platform_file_open(path, "rb");
+    if (file == NULL) return 0;
+    int valid = fseek(file, 0, SEEK_END) == 0 && ftell(file) == size;
+    fclose(file);
+    return valid;
+}
+
+int nds_load_firmware(nds_t *nds, uint64_t config_bits, uint64_t run_limit_us)
+{
+    if (!firmware_file_has_size(DATA_SYSTEM_DIR "/system/" DATA_BIOS7_REAL, 16384)
+        || !firmware_file_has_size(DATA_SYSTEM_DIR "/system/" DATA_BIOS9_REAL, 4096)
+        || !firmware_file_has_size(DATA_SYSTEM_DIR "/system/nds_firmware.bin", 262144))
+        return 0;
+    nds_rom_open_t open = {0};
+    open.config_bits = config_bits;
+    open.run_limit_us = run_limit_us;
+    open.state_slot = -1;
+    return nds_load_rom(nds, &open);
+}
+
 int nds_load_rom(nds_t *nds, const nds_rom_open_t *open)
 {
     frontend_t *g = FRONTEND;
@@ -138,6 +165,12 @@ int nds_load_rom(nds_t *nds, const nds_rom_open_t *open)
     uint64_t seed;
 
     (void)nds;
+
+    int multiplayer = seedless_mp_game_started(open->path == NULL);
+    if (multiplayer && (open->state_slot >= 0 || open->benchmark_frames > 0)) {
+        seedless_mp_game_stopped();
+        return 0;
+    }
 
     (void)video_out_gl_clear_framebuffers(NULL);
 
@@ -171,7 +204,10 @@ int nds_load_rom(nds_t *nds, const nds_rom_open_t *open)
     maps_dump_probe(g);
     autosave_rearm(g);
 
-    return nds_start_game(&params) == 0;
+    int result = nds_start_game(&params) == 0;
+    wifi_core_release();
+    seedless_mp_game_stopped();
+    return result;
 }
 
 int nds_insert_gba(nds_t *nds, const char *path, int state_slot, int in_cache_dir,
@@ -192,7 +228,9 @@ int nds_insert_gba(nds_t *nds, const char *path, int state_slot, int in_cache_di
     g->run_limit_us = run_limit_us;
     g->lid_closed = 0;
     __atomic_store_n(&g->quit_request, 0, __ATOMIC_RELEASE);
+    input_state_lock();
     g->buttons = 0;
+    input_state_unlock();
     g->state_slot = 0;
     g->state_saving = 0;
     g->state_load_request = 0;

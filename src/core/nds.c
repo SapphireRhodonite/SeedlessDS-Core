@@ -9,6 +9,7 @@
 #include "core/nds_state.h"
 #include "core/nds_start.h"
 #include "frontend/script/script_state.h"
+#include "wifi/wifi_core.h"
 
 void audio_out_unmute_and_resume(spu_t *spu);
 void *nds_clear_state_blocks(unsigned char *obj);
@@ -46,6 +47,7 @@ int nds_start_game(nds_start_params_t *params) {
     arm(((nds_t *)G)->save_dir, 0, fmt, params->save_dir);
 
     ((nds_t *)G)->bus.address_window = (uint8_t *)(uintptr_t)(uint64_t)-1;
+    ((nds_t *)G)->config.boot_from_firmware = params->rom_path == NULL;
     nds_machine_init(G);
 
     uint32_t mode = params->texture_format;
@@ -59,9 +61,14 @@ int nds_start_game(nds_start_params_t *params) {
     }
     video_out_gl_set_texture_format(mode);
 
-    if (cart_open_rom(
-            &nds_machine.cart, (char *)params->rom_path) != 0)
-        return -1;
+    if (params->rom_path != NULL) {
+        if (cart_open_rom(&nds_machine.cart, (char *)params->rom_path) != 0)
+            return -1;
+    } else {
+        memcpy(nds_machine.rom_name, "firmware", sizeof "firmware");
+        memset(&nds_machine.cart.backup, 0, sizeof nds_machine.cart.backup);
+        nds_machine.cart.game_code = 0;
+    }
 
     const unsigned char *src = params->config;
     nds_config_t *dst = &((nds_t *)G)->config;
@@ -125,11 +132,11 @@ void nds_machine_init(unsigned char *obj) {
 }
 
 void nds_machine_reset(unsigned char *machine) {
+    wifi_core_release();
 
     int (*format)(char *, long, const char *, ...) = str_vsprintf_limit_1024;
     int (*note)(void *, const char *, uint32_t) = mirror_query_unsupported;
     void (*descriptors)(unsigned char *) = arm_reset;
-    void (*clock)(uint64_t *)    = time_now_microseconds;
     void *(*reserve)(void *, uint32_t) = jit_cache_lookup_or_compile;
 
     nds_runtime_t *a = &((nds_t *)machine)->runtime;
@@ -172,16 +179,32 @@ void nds_machine_reset(unsigned char *machine) {
     ((nds_t *)machine)->sched.frame = 0;
     ((nds_t *)machine)->sched.cycles = 0;
     ((nds_t *)machine)->sched.scanline = SCHED_SCANLINE_RESET;
+    ((nds_t *)machine)->sched.vcount_pending = 0;
     ((nds_t *)machine)->sched.slice_cycles = 0;
 
     platform_doublebuffer_flip_signal();
 
     sched_event_insert(machine, NULL);
     sched_scanline_event(machine, NULL);
+    if (wifi_core_reset((nds_t *)machine) != 0) {
+        mirror_fatal_reset_longjmp(machine);
+        return;
+    }
     audio_out_unmute_and_resume(f);
-    cart_boot_from_header(e);
-
-    gamedb_apply_fixes(machine);
+    if (e->rom != NULL) {
+        cart_boot_from_header(e);
+        gamedb_apply_fixes(machine);
+    } else {
+        e->chip_id = 0xffffffffu;
+        e->transfer_mode = 0;
+        e->data_word = 0xffffffffu;
+        e->write_words_remaining = 0;
+        e->backup_write_mode = 0;
+        e->backup_write_enabled = 0;
+        e->secure_area_pending = 0;
+        arm9->pc = 0xffff0000u;
+        arm7->pc = 0;
+    }
 
     uint8_t *rest;
     if (a->jit_enabled != 0) {
@@ -203,14 +226,7 @@ void nds_machine_reset(unsigned char *machine) {
     }
     arm7->jit_block = rest;
 
-    gpu2d_worker_hook_noop();
-
-    uint64_t now;
-    clock(&now);
-    a->pacer_flag = 0;
-    *(uint32_t *)&a->skip_frame = 0;
-    a->pacer_base = now + now * 2;
-    a->pacer_accumulated = 0;
+    pacer_init(machine);
 }
 
 long nds_subsystem_notify_shutdown_pair(unsigned char *obj) {

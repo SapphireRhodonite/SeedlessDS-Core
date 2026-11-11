@@ -256,6 +256,7 @@ void video_out_gl_render_frame(uint32_t param_1, uint32_t param_2,
     uint32_t idx_sel = (~VIDEO_OUT_GL->page_parity) & 1u;
     if (recon_page_latched <= 1u) { idx_sel = recon_page_latched; recon_page_latched = 0xffu; }
     const uint8_t *lvar3 = VIDEO_OUT_GL->page[idx_sel];
+    recon_output_render_token = recon_output_page_token[idx_sel];
     int32_t  iVar1   = (int32_t)VIDEO_OUT_GL->screen_mode[idx];
     int32_t  iVar2   = (int32_t)VIDEO_OUT_GL->screen_mode[idx ^ 1u];
 

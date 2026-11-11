@@ -1,3 +1,4 @@
+#include "wifi/wifi_core.h"
 #include <stdint.h>
 #include "seedlessds/cpu_backend.h"
 #include <string.h>
@@ -259,16 +260,7 @@ void state_read_machine_blocks(uint8_t *machine, uint8_t *stream, uint32_t mode)
 
     arm9->debug.instruction_count = 0;
     arm7->debug.instruction_count = 0;
-    gpu2d_worker_hook_noop();
-
-    {
-        uint64_t clock;
-        time_now_microseconds(&clock);
-        runtime->pacer_flag = 0;
-        wr32(&runtime->skip_frame, 0);
-        runtime->pacer_base = clock * 3;
-        runtime->pacer_accumulated = 0;
-    }
+    pacer_init(machine);
 }
 
 
@@ -681,6 +673,7 @@ typedef void *(*fn_memcpy_chk)(void *, const void *, size_t, size_t);
 
 void *state_read_sched_block(sched_t *param_1, uint8_t *param_2, uint32_t param_3)
 {
+    param_1->vcount_pending = 0;
 
     static fn_memcpy_chk core_memcpy_chk;
     if (core_memcpy_chk == NULL)
@@ -2204,6 +2197,7 @@ uint32_t state_write_pending(void)
 int state_load_file(unsigned char *machine, const char *path,
                        unsigned char *top, unsigned char *bottom,
                        uint32_t only_look) {
+    if (!only_look && (wifi_core_active() || ((nds_t *)machine)->cart.rom == NULL)) return -1;
 
     void *(*c_malloc)(unsigned long) = (void *(*)(unsigned long))sym_libc_malloc;
     void  (*c_free)(void *)          = (void (*)(void *))sym_libc_free;
@@ -2413,6 +2407,7 @@ static void copy_bytes(void *dest, const void *origin, size_t size) {
 int32_t state_save_file(uint8_t *machine, const char *path,
                             const char *name_final, const void *copy_a,
                             const void *copy_b) {
+    if (wifi_core_active() || ((nds_t *)machine)->cart.rom == NULL) return -1;
 
     static fn_malloc_29 reserve;
     static fn_free_29 release;

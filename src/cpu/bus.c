@@ -22,6 +22,20 @@ static uint64_t asr64_2(uint64_t v)
 }
 typedef uint64_t (*fn_translate)(unsigned char *, uint32_t);
 
+uint64_t bus_main_ram_page_watch(unsigned char *table, uint32_t address, uint64_t entry)
+{
+    if ((address >> 24) != 2)
+        return entry;
+    bus_t *bus = PT(table)->bus;
+    uint32_t page = address & ~0x7ffu;
+    uint32_t offset = page & (NDS_MAIN_RAM_SIZE - 1);
+    if ((entry << 2) + page != (uintptr_t)(bus->main_ram + offset))
+        return entry;
+    if ((bus->main_ram_page_bits[offset >> 16] & (1u << ((offset >> 11) & 31))) != 0)
+        entry |= UINT64_C(0xc000000000000000);
+    return entry;
+}
+
 uint64_t bus_page_fill(unsigned char *base, uint32_t address)
 {
 
@@ -47,7 +61,7 @@ uint64_t bus_page_fill(unsigned char *base, uint32_t address)
         uint64_t aligned = (uint64_t)address & UINT64_C(0xfffff800);
         uint64_t dest = pointer_base + (aligned & mask);
         uint64_t cache = asr64_2(dest - aligned) | UINT64_C(0x4000000000000000);
-        PT(base)->page[index_cache] = cache;
+        PT(base)->page[index_cache] = bus_main_ram_page_watch(base, address, cache);
 
         uint32_t mask_reread = entry->mask;
         return pointer_base + (mask_reread & address);
@@ -73,7 +87,7 @@ uint64_t bus_page_fill(unsigned char *base, uint32_t address)
 
         uint64_t cache = asr64_2((result - inside_page) - aligned) |
                          UINT64_C(0x4000000000000000);
-        PT(base)->page[index_cache] = cache;
+        PT(base)->page[index_cache] = bus_main_ram_page_watch(base, address, cache);
         return result;
     }
 
@@ -92,7 +106,7 @@ static void mark(uint8_t *state, uint32_t dir, int64_t shift, int bit62) {
 
     uint64_t v = (uint64_t)(shift >> 2);
     if (bit62) v |= PAGETABLE_MISSING;
-    PT(state)->page[dir >> 11] = v;
+    PT(state)->page[dir >> 11] = bus_main_ram_page_watch(state, dir, v);
 }
 
 unsigned bus_read8_slow(uint8_t *state, unsigned dir) {
@@ -153,7 +167,7 @@ static void mark_2(uint8_t *state, uint32_t dir, int64_t shift, int bit62) {
 
     uint64_t v = (uint64_t)(shift >> 2);
     if (bit62) v |= PAGETABLE_MISSING;
-    PT(state)->page[dir >> 11] = v;
+    PT(state)->page[dir >> 11] = bus_main_ram_page_watch(state, dir, v);
 }
 
 unsigned bus_read16_slow(uint8_t *state, unsigned dir) {
@@ -232,7 +246,7 @@ uint64_t bus_read32_slow(uint8_t *ctx, uint32_t dir) {
         mark_3(ctx, al);
 
         int64_t e = (int64_t)((uint64_t)(uintptr_t)p - inside - al);
-        PT(ctx)->page[al >> 11] = (uint64_t)(e >> 2) | PAGETABLE_MISSING;
+        PT(ctx)->page[al >> 11] = bus_main_ram_page_watch(ctx, al, (uint64_t)(e >> 2) | PAGETABLE_MISSING);
 
         return rd32(p);
     }
@@ -248,7 +262,7 @@ uint64_t bus_read32_slow(uint8_t *ctx, uint32_t dir) {
         int64_t e = (int64_t)((uint64_t)(uintptr_t)base + (al & mask) - al);
         uint64_t ent = (uint64_t)(e >> 2);
         if (mark) ent |= PAGETABLE_MISSING;
-        PT(ctx)->page[dir >> 11] = ent;
+        PT(ctx)->page[dir >> 11] = bus_main_ram_page_watch(ctx, dir, ent);
 
         return rd32(base + ((uint64_t)r->mask & dir));
     }
@@ -282,7 +296,7 @@ static void mark_5(uint8_t *state, uint32_t dir, int64_t shift) {
     *b |= 1u << ((dir >> 11) & 31);
 
     uint64_t v = (uint64_t)(shift >> 2);
-    PT(state)->page[dir >> 11] = v;
+    PT(state)->page[dir >> 11] = bus_main_ram_page_watch(state, dir, v);
 }
 
 void bus_write8_slow(uint8_t *state, unsigned dir, unsigned value) {
@@ -350,7 +364,7 @@ static void mark_6(uint8_t *state, uint32_t dir, int64_t shift) {
     *b |= 1u << ((dir >> 11) & 31);
 
     uint64_t v = (uint64_t)(shift >> 2);
-    PT(state)->page[dir >> 11] = v;
+    PT(state)->page[dir >> 11] = bus_main_ram_page_watch(state, dir, v);
 }
 
 void bus_write16_slow(uint8_t *state, unsigned dir, unsigned value) {
@@ -416,7 +430,7 @@ static void mark_7(uint8_t *state, uint32_t dir, int64_t shift) {
     *b |= 1u << ((dir >> 11) & 31);
 
     uint64_t v = (uint64_t)(shift >> 2);
-    PT(state)->page[dir >> 11] = v;
+    PT(state)->page[dir >> 11] = bus_main_ram_page_watch(state, dir, v);
 }
 
 void bus_write32_slow(uint8_t *state, unsigned dir, unsigned value) {
@@ -1307,12 +1321,12 @@ void *bus_region_init_channel_descriptors(bus_t *bus)
     bus->region[40].write32 = (void *)io7_write32;
     bus->region[40].page_bits = 0;
     bus->region[40].code_bits = 0;
-    bus->region[41].read8 = (void *)io_reg_read_returns_zero;
+    bus->region[41].read8 = (void *)io_wifi_read8;
     bus->region[41].read16 = (void *)io_read_port16;
-    bus->region[41].read32 = (void *)io_read32_unmapped_zero;
+    bus->region[41].read32 = (void *)io_wifi_read32;
     bus->region[41].write8 = (void *)io9_write32_noop_tail;
     bus->region[41].write16 = (void *)io_write_port16;
-    bus->region[41].write32 = (void *)io7_write8_noop_tail;
+    bus->region[41].write32 = (void *)io_wifi_write32;
     bus->region[41].page_bits = 0;
     bus->region[41].code_bits = 0;
 
@@ -1348,10 +1362,10 @@ void *bus_region_init_channel_descriptors(bus_t *bus)
     bus->region[36].read_kind = 0;
     bus->region[36].write_kind = 0;
     bus->region[37].mask = 0x3fffffu;
-    bus->region[36].page_bits = bus->main_ram_code_bits;
-    bus->region[36].code_bits = bus->main_ram_page_bits;
-    bus->region[37].page_bits = bus->main_ram_code_bits;
-    bus->region[37].code_bits = bus->main_ram_page_bits;
+    bus->region[36].page_bits = bus->main_ram_page_bits;
+    bus->region[36].code_bits = bus->main_ram_code_bits;
+    bus->region[37].page_bits = bus->main_ram_page_bits;
+    bus->region[37].code_bits = bus->main_ram_code_bits;
     bus->region[36].read8 = hdr;
     bus->region[36].write8 = hdr;
     bus->region[37].read8 = hdr;
@@ -1654,6 +1668,28 @@ static void mark_range_bits(unsigned char *bitmap,
     wr32(tail, rd32(tail) | ~(0xFFFFFFFEu << end_bit));
 }
 
+static void watch_main_ram_aliases(bus_t *bus, uint32_t offset, uint32_t size)
+{
+    uint32_t last = (offset + size - 1) & ~0x7ffu;
+    for (uint32_t page = offset & ~0x7ffu; page <= last; page += 0x800) {
+        for (uint32_t alias = NDS_MAIN_RAM_BASE + page;
+             alias < NDS_SHARED_WRAM_BASE; alias += NDS_MAIN_RAM_SIZE) {
+            for (unsigned c = 0; c < 2; ++c) {
+                pagetable_t *table = c ? bus->arm7_pagetable : bus->arm9_pagetable;
+                if (!c && (alias < bus->itcm_size ||
+                           (alias >= bus->dtcm_start && alias < bus->dtcm_end)))
+                    continue;
+                uint64_t cached = table->page[alias >> 11];
+                uint64_t target = (uintptr_t)(bus->main_ram + page);
+                if ((cached << 2) != 0 && (cached << 2) + alias != target)
+                    continue;
+                int64_t shift = (int64_t)(target - alias);
+                mark((uint8_t *)table, alias, shift, 1);
+            }
+        }
+    }
+}
+
 void bus_range_mark_written(unsigned char *ctx, uint32_t address, uint32_t size)
 {
 
@@ -1728,6 +1764,10 @@ void bus_range_mark_written(unsigned char *ctx, uint32_t address, uint32_t size)
     mark_range_bits((unsigned char *)bitmap2,
                       (local_end >> 6) - (local >> 6),
                       (address >> 1) & 31, (local_end >> 1) & 31);
+
+    if ((address >> 24) == 2 &&
+        !(mode == 1 && ((bus_t *)core)->itcm_size > address))
+        watch_main_ram_aliases((bus_t *)core, local, sz);
 }
 #undef REC_SIZE
 #undef REC_OFF_MASK

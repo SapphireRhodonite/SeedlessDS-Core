@@ -10,6 +10,7 @@
 #endif
 #include <stdint.h>
 #include "hires_runtime.h"
+#include "seedlessds/nds.h"
 #include "blob_symbols.h"
 #include <stddef.h>
 #include <string.h>
@@ -378,8 +379,8 @@ static void resolve(void) {
     core_strrchr    = (char *(*)(const char *, int))sym_libc_strrchr;
 }
 
-int archive_rom_read_chunk(const char *path, uint32_t *out_size, void *dest,
-                       uint32_t len, uint32_t shift) {
+static int read_named_chunk(const char *path, const char *name, uint32_t *out_size,
+                            void *dest, uint32_t len, uint32_t shift) {
     resolve();
 
     const char *s_nds  = ".nds";
@@ -388,7 +389,7 @@ int archive_rom_read_chunk(const char *path, uint32_t *out_size, void *dest,
     const char *s_rar  = ".rar";
     const char *s_pat  = "nds";
 
-    const char *ext = core_strrchr(path, 0x2e);
+    const char *ext = core_strrchr(name, 0x2e);
     if (ext == 0) return -1;
 
     if (core_strcasecmp(ext, s_nds) == 0) {
@@ -432,6 +433,20 @@ int archive_rom_read_chunk(const char *path, uint32_t *out_size, void *dest,
     return archive_rar_read_range(path, s_pat, out_size, dest, len, shift);
 }
 
+
+int archive_rom_read_chunk(const char *path, uint32_t *out_size, void *dest,
+                           uint32_t len, uint32_t shift)
+{
+    return read_named_chunk(path, path, out_size, dest, len, shift);
+}
+
+int nds_rom_header(const char *path, const char *name, uint8_t header[NDS_CARTRIDGE_HEADER_BYTES])
+{
+    uint32_t size = 0;
+    return path && name && header &&
+           read_named_chunk(path, name, &size, header, NDS_CARTRIDGE_HEADER_BYTES, 0) == 0 &&
+           size >= NDS_CARTRIDGE_HEADER_BYTES;
+}
 
 int32_t archive_rom_extension_is_supported(const char *param_1)
 {

@@ -31,8 +31,10 @@ typedef struct sched {
     uint64_t cycles;
     uint32_t slice_cycles;
     uint16_t scanline;
-    uint8_t unmapped_0[2];
+    uint16_t vcount_pending;
     sched_deadline_t deadline[SCHED_DEADLINES];
     sched_deadline_t *head;
 } sched_t;
+
+void sched_write_vcount(sched_t *sched, uint16_t value, uint16_t mask);
 #endif

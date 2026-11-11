@@ -939,9 +939,9 @@ void *jit_cache_lookup_or_compile(void *ctx, uint32_t dir)
         uint32_t mask = ((dir & 0xff000000u) == 0x2000000u) ? 0x7fffu : 0x1fffu;
         jit_hash_entry_t *t = ((dir & 0xff000000u) == 0x2000000u) ? ar->main_ram_blocks : ar->other_blocks;
         ent = &t[(dir >> 2) & mask];
-        if (ent->pc == dir)     { uint32_t o_ = ent->offset; LOOKUP_RETURN(b + o_, o_); }
+        if (ent->pc == dir && ent->offset != 0) { uint32_t o_ = ent->offset; LOOKUP_RETURN(b + o_, o_); }
         off = ent->offset_2;
-        if (ent->pc_2 == dir) LOOKUP_RETURN(b + off, off);
+        if (ent->pc_2 == dir && off != 0) LOOKUP_RETURN(b + off, off);
         if (off) {
 
             uint8_t *n = b + rd32(b + off - 4);
@@ -1039,13 +1039,13 @@ void *jit_block_lookup(void *param_1, uint32_t param_2)
         }
 
         uint32_t w0 = entry->pc;
-        if (w0 == key) {
+        if (w0 == key && entry->offset != 0) {
             return (void *)(base + entry->offset);
         }
 
         uint32_t addr2   = entry->pc_2;
         uint32_t target2 = entry->offset_2;
-        if (addr2 == key) {
+        if (addr2 == key && target2 != 0) {
             return (void *)(base + target2);
         }
 

@@ -420,7 +420,7 @@ static int dispatch_hires_raster(gpu_t *gpu, uint32_t mode, int defer) {
         boss_hdr->pass = (uint8_t)batch;
         uint32_t threads = recon_threads_3d(*(uint32_t *)(g + 1168));
 
-        int deferred = defer && threads > 1u && recon_scale_3d > 2u
+        int deferred = defer && threads > 1u && recon_scale_3d >= 2u
             && (state->disp3dcnt & 0x4000u) == 0u;
         gpu3d_raster_band_compose_begin(gpu, deferred && RECON_BANDS != 24u
             && RECON_BANDS > 1u && RECON_BANDS <= RECON_BAND_CAPACITY

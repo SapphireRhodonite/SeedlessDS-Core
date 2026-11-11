@@ -6,6 +6,7 @@
 #include "core_internals.h"
 #include "memory/io_common.h"
 #include "mem_access.h"
+#include "wifi/wifi_core.h"
 
 static void *const io_cache_write_handlers[3] = {
     (void *)io_reg_cache_write8,
@@ -15,6 +16,10 @@ static void *const io_cache_write_handlers[3] = {
 
 void io_write_port16(unsigned char *state, uint32_t dir, uint32_t value)
 {
+    if (wifi_core_active()) {
+        wifi_core_write(dir, (uint16_t)value);
+        return;
+    }
 
     uint32_t sel = dir & 0xc000u;
     uint32_t off = dir & 0x3fffu;
@@ -53,6 +58,7 @@ int io_reg_read_returns_zero(long a0, long a1, long a2, long a3, long a4, long a
 #define TABLE_15C      0xfb9b8
 
 unsigned int io_read_port16(const uint8_t *state, unsigned int dir) {
+    if (wifi_core_active()) return wifi_core_read(dir);
 
     unsigned off = dir & 0x3fff;
 
@@ -85,6 +91,28 @@ unsigned int io_read_port16(const uint8_t *state, unsigned int dir) {
 #undef PORTS_TABLE
 #undef REG_15C
 #undef TABLE_15C
+
+uint32_t io_wifi_read8(const uint8_t *state, uint32_t address)
+{
+    (void)state;
+    if (!wifi_core_active()) return 0;
+    return (wifi_core_read(address & ~1u) >> ((address & 1u) * 8)) & 0xFFu;
+}
+
+uint32_t io_wifi_read32(const uint8_t *state, uint32_t address)
+{
+    (void)state;
+    if (!wifi_core_active()) return 0;
+    return wifi_core_read(address) | ((uint32_t)wifi_core_read(address + 2) << 16);
+}
+
+void io_wifi_write32(uint8_t *state, uint32_t address, uint32_t value)
+{
+    (void)state;
+    if (!wifi_core_active()) return;
+    wifi_core_write(address, (uint16_t)value);
+    wifi_core_write(address + 2, (uint16_t)(value >> 16));
+}
 
 int io_read32_unmapped_zero(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7) {
     (void)a0; (void)a1; (void)a2; (void)a3;
