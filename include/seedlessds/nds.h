@@ -70,6 +70,7 @@ const char *nds_info_string(nds_t *nds, char *buffer, size_t size);
 
 #define NDS_CARTRIDGE_HEADER_BYTES 32
 int nds_rom_header(const char *path, const char *name, uint8_t header[NDS_CARTRIDGE_HEADER_BYTES]);
+int nds_rom_read_section(const char *path, const char *name, int offset, uint8_t *data, int length);
 int nds_rom_is_nds(const char *path);
 int nds_rom_type(const char *path);
 uint32_t nds_rom_size(const char *path);

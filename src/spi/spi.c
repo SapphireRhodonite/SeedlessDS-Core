@@ -20,8 +20,7 @@ uint32_t spi_tsc_transfer_byte(spi_tsc_t *tsc, unsigned char *base,
 
     if (channel == 6u) {
         spu_t *spu = &((nds_t *)base)->spu;
-        if (spu->mixer.mic_loaded == 0)
-            spu->mixer.mic_init_pending = 1;
+        spu->mixer.mic_init_pending = 1;
 
         uint32_t m = spu_resample_sample_by_time(spu, ((nds_t *)base)->sched.cycles);
         uint32_t centered = ((uint32_t)(int32_t)(int16_t)m + TSC_MIC_SAMPLE_BIAS) >> 4;
@@ -109,7 +108,7 @@ uint32_t spi_transfer_byte(spi_t *spi, uint32_t value) {
         if (channel == 6) {
             uint8_t *b = (uint8_t *)spi->machine;
             spu_t *spu = &((nds_t *)b)->spu;
-            if (spu->mixer.mic_loaded == 0) spu->mixer.mic_init_pending = 1;
+            spu->mixer.mic_init_pending = 1;
             uint32_t v = spu_resample_sample_by_time(spu, ((nds_t *)b)->sched.cycles);
             tsc->channels[6] = (uint16_t)((((uint32_t)(int32_t)(int16_t)v)
                                             + TSC_MIC_SAMPLE_BIAS) >> 4);

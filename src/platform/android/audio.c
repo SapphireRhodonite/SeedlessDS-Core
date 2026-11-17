@@ -2,6 +2,11 @@
 #include "blob_symbols.h"
 #include "core/nds_state.h"
 #include <stdint.h>
+#include <stdatomic.h>
+#ifdef __ANDROID__
+#include <jni.h>
+#include "frontend/frontend.h"
+#endif
 #include <string.h>
 #include "platform/android/audio.h"
 #include "frontend/audio_out.h"
@@ -10,6 +15,40 @@
 #include "mem_access.h"
 
 typedef void    (*fn_vcall3)(void*, void*, int32_t);
+
+static atomic_int microphone_permission_waiting;
+
+#ifdef __ANDROID__
+JNIEXPORT void JNICALL
+Java_com_seedlessds_core_SeedlessCore_retryMicrophonePermission(JNIEnv *env, jclass cls)
+{
+    (void)env;
+    (void)cls;
+    atomic_store(&microphone_permission_waiting, 0);
+}
+
+static int microphone_permitted(void)
+{
+    JavaVM *vm = FRONTEND->jni.vm;
+    JNIEnv *env;
+    if (vm == NULL || (*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) return 0;
+    jclass owner = (*env)->FindClass(env, "com/seedlessds/app/emu/DeviceMicrophonePermission");
+    jboolean allowed = JNI_FALSE;
+    if (owner != NULL) {
+        jmethodID check = (*env)->GetStaticMethodID(env, owner, "allowDeviceCapture", "()Z");
+        if (check != NULL) allowed = (*env)->CallStaticBooleanMethod(env, owner, check);
+    }
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        allowed = JNI_FALSE;
+    }
+    if (owner != NULL) (*env)->DeleteLocalRef(env, owner);
+    return allowed == JNI_TRUE;
+}
+#else
+static int microphone_permitted(void) { return 1; }
+#endif
 
 void platform_audio_output_feed_frame(spu_t *spu)
 {
@@ -23,12 +62,24 @@ void platform_audio_output_feed_frame(spu_t *spu)
     if (spu->mixer.muted != 0)      goto L_5;
     if (PLATFORM_AUDIO->closed != 0)          goto L_5;
 
-    if (spu->mixer.mic_enabled != 0 &&
-        spu->mixer.mic_init_pending != 0 &&
-        spu->mixer.mic_init_failed == 0) {
-        spu->mixer.mic_init_pending = 0;
-        int32_t r = mic_init_recorder((long)(unsigned long)ctx);
-        if (r < 0) spu->mixer.mic_init_failed = 1;
+    int requested = spu->mixer.mic_enabled && spu->mixer.mic_init_pending;
+    int use_device = audio_out_enabled && !PLATFORM_AUDIO->sound_disabled && !spu->recording.active;
+    spu->mixer.mic_init_pending = 0;
+    if (!use_device && PLATFORM_AUDIO->mic_started)
+        nds_subsystem_notify_shutdown_pair(ctx);
+    if (!requested || !use_device) {
+        if (atomic_load_explicit(&microphone_permission_waiting, memory_order_relaxed))
+            atomic_store(&microphone_permission_waiting, 0);
+    }
+    if (requested && !use_device && !spu->mixer.mic_loaded)
+        mic_init_recorder((long)(uintptr_t)ctx, 0);
+    if (requested && use_device && !PLATFORM_AUDIO->mic_started && !spu->mixer.mic_init_failed &&
+        !atomic_load_explicit(&microphone_permission_waiting, memory_order_relaxed)) {
+        atomic_store(&microphone_permission_waiting, 1);
+        if (microphone_permitted()) {
+            if (mic_init_recorder((long)(uintptr_t)ctx, 1) < 0) spu->mixer.mic_init_failed = 1;
+            atomic_store(&microphone_permission_waiting, 0);
+        }
     }
 
     {
@@ -121,7 +172,7 @@ void platform_audio_output_feed_frame(spu_t *spu)
 
         {
             void *engine = PLATFORM_AUDIO->record_itf;
-            if (engine == NULL) goto L_3;
+            if (engine == NULL || !PLATFORM_AUDIO->mic_started) goto L_3;
 
             uint32_t n = count & 0x7fffffffu;
             if (n != 0) {

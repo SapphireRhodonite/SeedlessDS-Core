@@ -133,7 +133,8 @@ uint32_t io9_read16(unsigned char *ctx, uint32_t dir) {
     }
 
 backup:
-    return *(uint16_t *)((unsigned char *)bus->io_mirror + (dir & 0x7fff));
+    if (dir > IO_MIRROR_SIZE - sizeof(uint16_t)) return 0;
+    return rd16_at(bus->io_mirror, dir);
 }
 
 uint32_t io9_read8(unsigned char *obj, uint32_t dir) {
@@ -273,7 +274,8 @@ uint32_t io9_read32(uint8_t *ctx, uint32_t dir) {
     }
 
 backup:
-    return rd32(ctx + (dir & 0x7fffu) + IO9_MIRROR);
+    if (dir > IO_MIRROR_SIZE - sizeof(uint32_t)) return 0;
+    return rd32_at(bus->io_mirror, dir);
 }
 #undef BUS
 #undef IO9_MIRROR

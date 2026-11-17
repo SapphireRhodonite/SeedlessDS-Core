@@ -70,7 +70,7 @@ void *archive_open_rom(const char *path, const char *cache,
     int (*cmpi)(const char *, const char *) =
         (int (*)(const char *, const char *))sym_libc_strcasecmp;
 
-    if (cmpi(ext, ".nds") == 0) {
+    if (cmpi(ext, ".nds") == 0 || cmpi(ext, ".srl") == 0) {
 
         *(uint32_t *)(b + 24) = 0;
         *(uint64_t *)b = (uint64_t)(int64_t)fd;
@@ -392,7 +392,7 @@ static int read_named_chunk(const char *path, const char *name, uint32_t *out_si
     const char *ext = core_strrchr(name, 0x2e);
     if (ext == 0) return -1;
 
-    if (core_strcasecmp(ext, s_nds) == 0) {
+    if (core_strcasecmp(ext, s_nds) == 0 || core_strcasecmp(ext, ".srl") == 0) {
 
         if (dest == 0)  return 0;
         if (len == 0) return 0;
@@ -446,6 +446,21 @@ int nds_rom_header(const char *path, const char *name, uint8_t header[NDS_CARTRI
     return path && name && header &&
            read_named_chunk(path, name, &size, header, NDS_CARTRIDGE_HEADER_BYTES, 0) == 0 &&
            size >= NDS_CARTRIDGE_HEADER_BYTES;
+}
+
+int nds_rom_read_section(const char *path, const char *name, int offset, uint8_t *data, int length)
+{
+    uint32_t size = 0;
+    if (!path || !name || !data || offset < 0 || length <= 0)
+        return -1;
+    if (read_named_chunk(path, name, &size, data, (uint32_t)length, (uint32_t)offset) == 0)
+        return length;
+    if (size == 0 || (uint32_t)offset > size)
+        return -1;
+    uint32_t available = size - (uint32_t)offset;
+    if (available == 0) return 0;
+    if (available >= (uint32_t)length) return -1;
+    return read_named_chunk(path, name, &size, data, available, (uint32_t)offset) == 0 ? (int)available : -1;
 }
 
 int32_t archive_rom_extension_is_supported(const char *param_1)

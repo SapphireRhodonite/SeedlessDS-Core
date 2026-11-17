@@ -24,6 +24,7 @@ public:
     void ARM7Write16(u32 a, u16 v) { Host.write16(UserData, a, v); }
     void ARM7Write32(u32 a, u32 v) { Host.write32(UserData, a, v); }
     std::array<u8,6> Mac() const { std::array<u8,6> mac; std::copy_n(Host.firmware+0x36, 6, mac.begin()); return mac; }
+    u8 RFChipType() const { return Host.firmware[0x40]; }
     u16 Channels() const { return Host.firmware[0x3c] | (u16(Host.firmware[0x3d]) << 8); }
     void Stop() { Host.stop(UserData); }
     bool IsWMTraceActive() const { return Trace.Active; }

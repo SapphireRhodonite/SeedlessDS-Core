@@ -57,7 +57,7 @@ void mic_capture_queue_callback(void *caller, void *context)
 #define OFF_RODATA_SLES     0x10a0a0
 #define OFF_CALLBACK_FN     0x1d6b4
 
-int mic_init_recorder(long param_1)
+int mic_init_recorder(long param_1, int use_device)
 {
 
     unsigned char *ctx  = (unsigned char *)(unsigned long)param_1;
@@ -72,9 +72,7 @@ int mic_init_recorder(long param_1)
         p_memset(((spu_t *)ctx)->mic_buffer, 0, sizeof ((spu_t *)ctx)->mic_buffer);
     }
 
-    uint32_t audio_on = audio_out_enabled;
-
-    if (audio_on != 0) {
+    if (use_device) {
         void *record_obj;
         record_obj = PLATFORM_AUDIO->recorder;
 
@@ -118,7 +116,12 @@ int mic_init_recorder(long param_1)
             }
 
             if (rc != 0) {
-
+                if (PLATFORM_AUDIO->recorder != NULL) {
+                    void *object = PLATFORM_AUDIO->recorder;
+                    void **methods = rd_ptr(object);
+                    ((void (*)(void *))methods[6])(object);
+                    PLATFORM_AUDIO->recorder = NULL;
+                }
                 return -1;
             }
 

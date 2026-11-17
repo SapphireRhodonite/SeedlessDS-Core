@@ -1,13 +1,16 @@
 #ifdef __ANDROID__
 
 #include <android/log.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <ucontext.h>
 
@@ -19,6 +22,7 @@ static char          cr_zip[512];
 static char          cr_rom[512];
 static uint32_t      cr_table[256];
 static int           cr_installed;
+static unsigned long cr_module_base;
 static int           cr_fd_saf = -1;
 static int           cr_fd_log = -1;
 
@@ -98,6 +102,7 @@ static void cr_w(int fd, const void *p, size_t n)
     size_t total = n;
     while (n) {
         ssize_t k = write(fd, b, n);
+        if (k < 0 && errno == EINTR) continue;
         if (k <= 0) break;
         b += k; n -= (size_t)k;
     }
@@ -140,6 +145,138 @@ static int cr_file(int fd, const char *name, const char *path, uint32_t cap)
     if (n <= 0) return 0;
     cr_entry_write(fd, name, cr_arena, (uint32_t)n);
     return 1;
+}
+
+struct cr_mapping {
+    uintptr_t start;
+    uintptr_t end;
+    uintptr_t file_offset;
+    int executable;
+    char path[512];
+};
+
+static int cr_hex(const char **pos, uintptr_t *number)
+{
+    const char *begin = *pos;
+    uintptr_t value = 0;
+    for (;;) {
+        const char c = **pos;
+        unsigned digit;
+        if (c >= '0' && c <= '9') digit = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') digit = (unsigned)(c - 'a' + 10);
+        else break;
+        if (value > (UINTPTR_MAX - digit) / 16) return 0;
+        value = value * 16 + digit;
+        ++*pos;
+    }
+    *number = value;
+    return *pos != begin;
+}
+
+static int cr_parse_mapping(const char *line, struct cr_mapping *mapping)
+{
+    const char *p = line;
+    size_t pos = 0;
+    if (!cr_hex(&p, &mapping->start) || *p++ != '-' || !cr_hex(&p, &mapping->end)
+            || *p++ != ' ' || cr_len(p) < 5) return 0;
+    mapping->executable = p[2] == 'x';
+    p += 4;
+    while (*p == ' ') ++p;
+    if (!cr_hex(&p, &mapping->file_offset)) return 0;
+    for (int field = 0; field < 2; ++field) {
+        while (*p == ' ') ++p;
+        if (!*p) return 0;
+        while (*p && *p != ' ') ++p;
+    }
+    while (*p == ' ') ++p;
+    cr_put(mapping->path, &pos, sizeof mapping->path, *p ? p : "[anonymous]");
+    return mapping->start < mapping->end;
+}
+
+static void cr_write_thread(int fd, const ucontext_t *context)
+{
+    static char chunk[4096], line[4096], info[4096];
+    struct cr_mapping mapping, pc_map = {0}, lr_map = {0}, stack_map = {0};
+    const uintptr_t pc = context->uc_mcontext.pc, lr = context->uc_mcontext.regs[30];
+    const uintptr_t sp = context->uc_mcontext.sp;
+    size_t used = 0, pos = 0, exec_size = 0;
+    int overflow = 0, missing_maps = 0;
+    int maps = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (maps >= 0) {
+        for (;;) {
+            ssize_t n = read(maps, chunk, sizeof chunk);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { if (n < 0) missing_maps = 1; break; }
+            for (ssize_t i = 0; i < n; ++i) {
+                if (chunk[i] != '\n') {
+                    if (used < sizeof line - 1) line[used++] = chunk[i];
+                    else overflow = 1;
+                    continue;
+                }
+                line[used] = 0;
+                if (overflow) missing_maps = 1;
+                if (cr_parse_mapping(line, &mapping)) {
+                    if (mapping.executable && used + 1 <= sizeof cr_arena - exec_size) {
+                        memcpy(cr_arena + exec_size, line, used);
+                        exec_size += used;
+                        cr_arena[exec_size++] = 10;
+                    } else if (mapping.executable) missing_maps = 1;
+                    if (pc >= mapping.start && pc < mapping.end) pc_map = mapping;
+                    if (lr >= mapping.start && lr < mapping.end) lr_map = mapping;
+                    if (sp >= mapping.start && sp < mapping.end) stack_map = mapping;
+                }
+                used = 0;
+                overflow = 0;
+            }
+        }
+        close(maps);
+        if (used) missing_maps = 1;
+    } else missing_maps = 1;
+    if (exec_size) cr_entry_write(fd, "executable-maps.txt", cr_arena, (uint32_t)exec_size);
+    cr_put(info, &pos, sizeof info, "pid ");
+    cr_put_u(info, &pos, sizeof info, (uint64_t)getpid(), 0);
+    cr_put(info, &pos, sizeof info, " tid ");
+    cr_put_u(info, &pos, sizeof info, (uint64_t)syscall(__NR_gettid), 0);
+    char thread_name[16] = {0};
+    if (syscall(__NR_prctl, PR_GET_NAME, thread_name, 0L, 0L, 0L) == 0) {
+        cr_put(info, &pos, sizeof info, " name ");
+        cr_put(info, &pos, sizeof info, thread_name);
+    }
+    const uintptr_t registers[] = {pc, lr, sp};
+    const struct cr_mapping *regions[] = {&pc_map, &lr_map, &stack_map};
+    const char *labels[] = {"\npc ", "\nlr ", "\nsp "};
+    for (size_t i = 0; i < 3; ++i) {
+        const struct cr_mapping *region = regions[i];
+        cr_put(info, &pos, sizeof info, labels[i]);
+        cr_put_u(info, &pos, sizeof info, registers[i], 1);
+        if (!region->end) { cr_put(info, &pos, sizeof info, " unmapped or maps unavailable"); continue; }
+        cr_put(info, &pos, sizeof info, " mapping ");
+        cr_put_u(info, &pos, sizeof info, region->start, 1);
+        cr_put(info, &pos, sizeof info, "-");
+        cr_put_u(info, &pos, sizeof info, region->end, 1);
+        cr_put(info, &pos, sizeof info, region->executable ? " executable " : " non-executable ");
+        cr_put(info, &pos, sizeof info, region->path);
+        cr_put(info, &pos, sizeof info, " mapping_file_offset 0x");
+        cr_put_u(info, &pos, sizeof info, region->file_offset, 1);
+        cr_put(info, &pos, sizeof info, " address_file_offset 0x");
+        cr_put_u(info, &pos, sizeof info, region->file_offset + (registers[i] - region->start), 1);
+    }
+    ssize_t copied = 0;
+    if (stack_map.end) {
+        size_t count = stack_map.end - sp;
+        if (count > 16384) count = 16384;
+        int mem = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+        if (mem >= 0) {
+            do { copied = pread(mem, cr_arena, count, (off_t)sp); } while (copied < 0 && errno == EINTR);
+            close(mem);
+            if (copied > 0) cr_entry_write(fd, "stack.bin", cr_arena, (uint32_t)copied);
+        }
+    }
+    cr_put(info, &pos, sizeof info, missing_maps ? "\nexecutable_maps partial" : "\nexecutable_maps complete");
+    cr_put(info, &pos, sizeof info, "\nstack_bytes_from_sp ");
+    cr_put_u(info, &pos, sizeof info, copied > 0 ? (uint64_t)copied : 0, 0);
+    cr_put(info, &pos, sizeof info, "\n");
+    cr_entry_write(fd, "thread.txt", (const unsigned char *)info, (uint32_t)pos);
 }
 
 static int cr_log_tail(int fd)
@@ -227,8 +364,9 @@ static void cr_handle(int sig, siginfo_t *si, void *uc)
     size_t o = 0, ao;
     int fd, i, has_rom, sav_ok, log_ok, in_folder_rom = 1;
 
-    if (cr_installed != 1) _exit(128 + sig);
-    cr_installed = 2;
+    int expected = 1;
+    if (!__atomic_compare_exchange_n(&cr_installed, &expected, 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        _exit(128 + sig);
 
     {
         unsigned long long pc = (unsigned long long)u->uc_mcontext.pc;
@@ -305,7 +443,7 @@ static void cr_handle(int sig, siginfo_t *si, void *uc)
     cr_put(txt, &o, sizeof txt, "\nrom: ");
     cr_put(txt, &o, sizeof txt, has_rom ? cr_rom : "unknown");
     {
-        unsigned long base = nds_module_base();
+        unsigned long base = cr_module_base;
         cr_put(txt, &o, sizeof txt, "\n\nbase: 0x");
         cr_put_u(txt, &o, sizeof txt, (uint64_t)base, 1);
         cr_put(txt, &o, sizeof txt,
@@ -313,18 +451,6 @@ static void cr_handle(int sig, siginfo_t *si, void *uc)
     }
     cr_put_u(txt, &o, sizeof txt, (uint64_t)u->uc_mcontext.pc, 1);
 
-    {
-        unsigned long base = nds_module_base();
-        unsigned long rel = (unsigned long)u->uc_mcontext.pc - base;
-        if (base && (unsigned long)u->uc_mcontext.pc > base && rel < (64UL << 20)) {
-            cr_put(txt, &o, sizeof txt, "   (librecon_fn.so + 0x");
-            cr_put_u(txt, &o, sizeof txt, (uint64_t)rel, 1);
-            cr_put(txt, &o, sizeof txt, ")");
-        } else {
-            cr_put(txt, &o, sizeof txt,
-                   "   (outside librecon_fn.so)");
-        }
-    }
     cr_put(txt, &o, sizeof txt, "\nsp:   0x");
     cr_put_u(txt, &o, sizeof txt, (uint64_t)u->uc_mcontext.sp, 1);
     cr_put(txt, &o, sizeof txt, "\nlr:   0x");
@@ -339,6 +465,7 @@ static void cr_handle(int sig, siginfo_t *si, void *uc)
     }
 
     cr_entry_write(fd, "REPORT.txt", (const unsigned char *)txt, (uint32_t)o);
+    cr_write_thread(fd, u);
 
     o = 0;
     cr_put(txt, &o, sizeof txt, "model: ");
@@ -416,6 +543,7 @@ void recon_crash_install(void)
 
     if (cr_installed) return;
 
+    cr_module_base = nds_module_base();
     cr_table_init();
 
     ss.ss_sp = stack;
@@ -429,7 +557,7 @@ void recon_crash_install(void)
     sigemptyset(&sa.sa_mask);
     for (i = 0; i < (int)(sizeof signals / sizeof signals[0]); i++)
         sigaction(signals[i], &sa, 0);
-    cr_installed = 1;
+    __atomic_store_n(&cr_installed, 1, __ATOMIC_RELEASE);
 
     __android_log_print(4, "reconDS", "CRASH REPORT installed (%d signals)",
                         (int)(sizeof signals / sizeof signals[0]));

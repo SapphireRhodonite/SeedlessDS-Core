@@ -409,13 +409,26 @@ uint32_t vram_reg_cache_read32_init(uint8_t *param_1, uint64_t param_2)
 #undef OFF_PALETTE
 #undef PALETTE_RAM_SIZE
 
+#define SUB_OBJ_BASE 0x06600000u
+#define SUB_OBJ_WINDOW_SIZE 0x200000u
+#define SUB_OBJ_VRAM_SIZE 0x20000u
+
+static uint32_t arm9_vram_address(uint32_t address)
+{
+    if (address - SUB_OBJ_BASE < SUB_OBJ_WINDOW_SIZE)
+        return SUB_OBJ_BASE + (address & (SUB_OBJ_VRAM_SIZE - 1));
+    return address;
+}
+
 void *vram_resolve_ptr_region10(bus_t *bus, uint32_t dir) {
+    dir = arm9_vram_address(dir);
     uint32_t i = (dir >> 14) & 0x3ff;
     return bus->gpu->vram.slot_base[i] + (dir & 0xffffff);
 }
 
 unsigned char *vram_resolve_ptr_bus_tagged(bus_t *bus, uint32_t dir)
 {
+    dir = arm9_vram_address(dir);
     vram_map_t *vram = &bus->gpu->vram;
     unsigned char *ctx = (unsigned char *)vram;
     uint32_t idx = (dir >> 14) & 0x3ffu;
@@ -643,6 +656,33 @@ static unsigned char *pagetable_arm9(vram_map_t *vram)
     return (unsigned char *)vram->bus->arm9_pagetable;
 }
 
+static void invalidate_arm9_vram_pages(vram_map_t *vram, uint32_t address, uint32_t length)
+{
+    if (address != SUB_OBJ_BASE) {
+        pagetable_unmap_range(pagetable_arm9(vram), address, length);
+        return;
+    }
+
+    bus_t *bus = vram->bus;
+    pagetable_t *table = bus->arm9_pagetable;
+    uint32_t *group = &table->group_bits[SUB_OBJ_BASE >> 21];
+    for (uint32_t blocks = *group; blocks; blocks &= blocks - 1) {
+        unsigned block_bit = __builtin_ctz(blocks);
+        uint32_t block = (SUB_OBJ_BASE >> 16) + block_bit;
+        for (uint32_t pages = table->page_bits[block]; pages; pages &= pages - 1) {
+            unsigned page_bit = __builtin_ctz(pages);
+            uint32_t page = (block << 5) + page_bit;
+            uint32_t addr = page << PAGETABLE_PAGE_SHIFT;
+            if (addr < bus->itcm_size || (addr >= bus->dtcm_start && addr < bus->dtcm_end))
+                continue;
+            table->page[page] = PAGETABLE_MISSING;
+            table->page_bits[block] &= ~(1u << page_bit);
+        }
+        if (!table->page_bits[block])
+            *group &= ~(1u << block_bit);
+    }
+}
+
 static void unmap_round(vram_map_t *vram, vram_bank_t *obj,
                            uint32_t bank, uint32_t j0)
 {
@@ -652,7 +692,7 @@ static void unmap_round(vram_map_t *vram, vram_bank_t *obj,
     uint8_t *ptr;
     uint32_t mask, j, cnt;
 
-    pagetable_unmap_range(pagetable_arm9(vram), sh + NDS_VRAM_BASE, (uint32_t)(n << 14));
+    invalidate_arm9_vram_pages(vram, sh + NDS_VRAM_BASE, (uint32_t)(n << 14));
 
     ptr = pbase - (uint64_t)sh;
     mark_range(vram, j0, n);
@@ -940,7 +980,7 @@ L_generic:
         w19 = (uint32_t)(w25 << 14);
         w22n = (uint32_t)(nn << 14);
 
-        pagetable_unmap_range(pagetable_arm9(vram), w19 + NDS_VRAM_BASE, w22n);
+        invalidate_arm9_vram_pages(vram, w19 + NDS_VRAM_BASE, w22n);
         mark_range(vram, w25, nn);
 
         p = x21 - (uint64_t)w19;

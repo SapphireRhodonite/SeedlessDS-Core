@@ -212,7 +212,7 @@ void input_state_lock(void);
 void input_state_unlock(void);
 void input_record_reset_state(unsigned char *obj, void *ctx);
 void mic_capture_queue_callback(void *caller, void *context);
-int mic_init_recorder(long param_1);
+int mic_init_recorder(long param_1, int use_device);
 void jit_hook_register_dual_slot(unsigned char *machine, void *arg);
 int32_t script_run_file(const char *path);
 uint32_t script_cursor_push_float(void *obj, float value);
