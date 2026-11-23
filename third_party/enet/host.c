@@ -5,6 +5,28 @@
 #define ENET_BUILDING_LIB 1
 #include <string.h>
 #include "enet/enet.h"
+#ifdef __ANDROID__
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+
+static int
+enet_bind_host_interface (ENetSocket socket, const ENetAddress * address, unsigned index, int allowAddressBoundListener)
+{
+    const int result = enet_socket_bind_interface (socket, index);
+#ifdef __ANDROID__
+    if (result == ENET_INTERFACE_BIND_PERMISSION_DENIED && allowAddressBoundListener &&
+        address != NULL && address -> host != ENET_HOST_ANY)
+    {
+       const enet_uint32 outputInterface = htonl (index);
+       return setsockopt (socket, IPPROTO_IP, IP_UNICAST_IF, &outputInterface, sizeof (outputInterface));
+    }
+#else
+    (void) address;
+    (void) allowAddressBoundListener;
+#endif
+    return result;
+}
 
 /** @defgroup host ENet host functions
     @{
@@ -28,12 +50,12 @@
 ENetHost *
 enet_host_create (const ENetAddress * address, size_t peerCount, size_t channelLimit, enet_uint32 incomingBandwidth, enet_uint32 outgoingBandwidth)
 {
-    return enet_host_create_on_interface (address, peerCount, channelLimit, incomingBandwidth, outgoingBandwidth, 0);
+    return enet_host_create_on_interface (address, peerCount, channelLimit, incomingBandwidth, outgoingBandwidth, 0, 0);
 }
 
 ENetHost *
 enet_host_create_on_interface (const ENetAddress * address, size_t peerCount, size_t channelLimit,
-                               enet_uint32 incomingBandwidth, enet_uint32 outgoingBandwidth, unsigned interfaceIndex)
+                               enet_uint32 incomingBandwidth, enet_uint32 outgoingBandwidth, unsigned interfaceIndex, int allowAddressBoundListener)
 {
     ENetHost * host;
     ENetPeer * currentPeer;
@@ -57,7 +79,7 @@ enet_host_create_on_interface (const ENetAddress * address, size_t peerCount, si
 
     host -> socket = enet_socket_create (ENET_SOCKET_TYPE_DATAGRAM);
     if (host -> socket == ENET_SOCKET_NULL ||
-        (interfaceIndex && enet_socket_bind_interface (host -> socket, interfaceIndex) < 0) ||
+        (interfaceIndex && enet_bind_host_interface (host -> socket, address, interfaceIndex, allowAddressBoundListener) < 0) ||
         (address != NULL && enet_socket_bind (host -> socket, address) < 0))
     {
        if (host -> socket != ENET_SOCKET_NULL)

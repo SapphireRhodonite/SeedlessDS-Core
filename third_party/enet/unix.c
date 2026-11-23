@@ -252,7 +252,12 @@ enet_socket_bind_interface (ENetSocket socket, unsigned index)
     char name [IF_NAMESIZE];
     if (!index || !if_indextoname (index, name))
       return -1;
-    return setsockopt (socket, SOL_SOCKET, SO_BINDTODEVICE, name, strlen (name) + 1);
+    const int result = setsockopt (socket, SOL_SOCKET, SO_BINDTODEVICE, name, strlen (name) + 1);
+#ifdef __ANDROID__
+    if (result < 0 && errno == EPERM)
+      return ENET_INTERFACE_BIND_PERMISSION_DENIED;
+#endif
+    return result;
 #elif defined(IP_BOUND_IF)
     return index ? setsockopt (socket, IPPROTO_IP, IP_BOUND_IF, &index, sizeof (index)) : -1;
 #else

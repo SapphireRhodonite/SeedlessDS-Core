@@ -321,7 +321,7 @@ bool LAN::StartHost(const char* playername, int numplayers, bool hle, const Grou
     addr.host = group ? group->LocalAddress : ENET_HOST_ANY;
     addr.port = kLANPort;
 
-    Host = enet_host_create_on_interface(&addr, 16, 2, 0, 0, group ? group->Index : 0);
+    Host = enet_host_create_on_interface(&addr, 16, 2, 0, 0, group ? group->Index : 0, group != nullptr);
     if (!Host)
     {
         return false;
@@ -362,7 +362,7 @@ bool LAN::StartClient(const char* playername, const char* host, bool hle, const 
     WMServiceTerminal = false;
 
     ENetAddress local{group ? group->LocalAddress : ENET_HOST_ANY, 0};
-    Host = enet_host_create_on_interface(&local, 16, 2, 0, 0, group ? group->Index : 0);
+    Host = enet_host_create_on_interface(&local, 16, 2, 0, 0, group ? group->Index : 0, 0);
     if (!Host)
     {
         return false;
