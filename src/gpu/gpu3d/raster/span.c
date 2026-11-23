@@ -127,6 +127,13 @@ static inline int32_t sbfx32(uint32_t val, unsigned lsb, unsigned width)
     uint32_t signbit = 1u << (width - 1);
     return (int32_t)((field ^ signbit) - signbit);
 }
+static int gpu3d_raster_has_opaque_unmarked_edges(const gpu3d_polygon_t *polygon,
+                                                 uint32_t display, uint32_t flags);
+static uint32_t gpu3d_raster_unfilled_left(uint8_t *scratch, size_t row_array,
+                                          const gpu3d_bank_vertex_t *const *nodes,
+                                          uint32_t count, uint32_t first_y,
+                                          uint32_t rows, uint32_t bottom);
+
 #define SCRATCH_SZ 0x7450u
 
 void gpu3d_raster_span_edge_ramp_dispatch(uint8_t *param_1, const gpu3d_polygon_t *param_2,
@@ -201,6 +208,11 @@ void gpu3d_raster_span_edge_ramp_dispatch(uint8_t *param_1, const gpu3d_polygon_
                                 scratch + 0x6e0u,
                                 &local_b8[uVar19],
                                 param_4, uVar17, -1, uVar21);
+            if (gpu3d_raster_has_opaque_unmarked_edges(p2, flagA, uVar21)) {
+                uint32_t first_y = uVar28 > param_4 ? uVar28 : param_4;
+                tail_w6 |= gpu3d_raster_unfilled_left(scratch, 0x0b0u, local_b8,
+                                                      uVar19, first_y, uVar26, uVar18s);
+            }
 
             uint32_t clip2 = (param_4 < uVar28) ? param_4 : uVar28;
             uint32_t cnt = iVar22 + param_4 + uVar28 - clip2 - uVar18s;
@@ -628,6 +640,97 @@ static int32_t sbfx12(uint32_t v)
     return (int32_t)((f ^ 0x800u) - 0x800u);
 }
 
+enum { GPU3D_SPAN_SKIP_LEFT = 0x100u };
+
+static int gpu3d_raster_has_opaque_unmarked_edges(const gpu3d_polygon_t *polygon,
+                                                  uint32_t display, uint32_t flags)
+{
+    uint32_t attr = polygon->polygon_attr;
+    return (display & 0x30u) == 0 && (attr & 0x1f0000u) == 0x1f0000u
+        && (attr & 0x30u) != 0x30u && (flags & 1u) == 0;
+}
+
+static uint32_t gpu3d_raster_unfilled_left(uint8_t *scratch, size_t row_array,
+                                          const gpu3d_bank_vertex_t *const *nodes,
+                                          uint32_t count, uint32_t first_y,
+                                          uint32_t rows, uint32_t bottom)
+{
+    uint8_t *coverage = scratch + 10u * row_array;
+    const uint8_t *left = scratch + 8u * row_array;
+    const uint8_t *right = scratch + 9u * row_array;
+    const uint32_t one = 1u << 18;
+    uint32_t end_y = first_y + rows;
+    uint32_t active = 0;
+    memset(coverage, 0, rows * 4u);
+
+    for (uint32_t i = 0; i + 1u < count; ++i) {
+        const gpu3d_bank_vertex_t *a = nodes[i];
+        const gpu3d_bank_vertex_t *b = nodes[i + 1];
+        if (b->y <= first_y || a->y >= end_y || b->y <= a->y)
+            continue;
+
+        uint32_t dy = (uint32_t)b->y - a->y;
+        int32_t dx = (int32_t)b->x - a->x;
+        if (dx <= (int32_t)dy)
+            continue;
+        uint32_t increment = (uint32_t)dx * (one / dy);
+        if (increment <= one)
+            continue;
+
+        uint32_t top = a->y > first_y ? a->y : first_y;
+        uint32_t limit = b->y < end_y ? b->y : end_y;
+        uint32_t q18 = one / 2 + (top - a->y + 1u) * increment;
+        for (uint32_t y = top; y < limit; ++y, q18 += increment) {
+            uint32_t row = 4u * (y - first_y);
+            uint32_t x0 = rd16(left + row) & 0x7fffu;
+            uint32_t x1 = rd16(right + row) & 0x7fffu;
+            uint32_t interior = a->x + (q18 >> 18);
+            if (x0 >= x1 || x0 >= interior)
+                continue;
+            if (y + 1u == bottom || interior >= x1) {
+                const gpu3d_bank_vertex_t *right_a = nodes[0];
+                const gpu3d_bank_vertex_t *right_b = NULL;
+                for (uint32_t j = count; j > 1u;) {
+                    right_b = nodes[--j];
+                    if (right_b->y > y && right_a->y <= y)
+                        break;
+                    right_a = right_b;
+                    right_b = NULL;
+                }
+                if (right_b == NULL || (y + 1u == bottom && b->x != right_b->x))
+                    continue;
+                int32_t right_dx = (int32_t)right_b->x - right_a->x;
+                uint32_t right_dy = (uint32_t)right_b->y - right_a->y;
+                if (interior >= x1 && right_dx > 0
+                    && (uint32_t)right_dx * (one / right_dy) == increment)
+                    continue;
+            }
+            uint32_t last = interior < x1 ? interior : x1;
+            wr16(coverage + row, (uint16_t)(last - x0));
+            active = GPU3D_SPAN_SKIP_LEFT;
+        }
+    }
+    return active;
+}
+
+static uint32_t gpu3d_raster_clip_unfilled_left(uint8_t *mask, const uint8_t *spans,
+                                               uint32_t rows, uint32_t count)
+{
+    const uint8_t *length = spans + 9u * RECON_3D_ROW_ARRAY;
+    const uint8_t *coverage = spans + 10u * RECON_3D_ROW_ARRAY;
+    for (uint32_t i = 0; i < rows; ++i, length += 4, coverage += 4) {
+        uint32_t width = rd16(length);
+        uint32_t skip = rd16(coverage);
+        if (skip > width)
+            skip = width;
+        for (uint32_t x = 0; x < skip; ++x)
+            count -= mask[x] != 0;
+        memset(mask, 0, skip);
+        mask += width;
+    }
+    return count;
+}
+
 void gpu3d_raster_span_edge_ramp_dispatch_hires(uint8_t *param_1, const gpu3d_polygon_t *param_2,
                          const gpu3d_bank_vertex_t *param_3,
                          uint32_t param_4, uint32_t param_5)
@@ -681,6 +784,11 @@ void gpu3d_raster_span_edge_ramp_dispatch_hires(uint8_t *param_1, const gpu3d_po
             gpu3d_raster_line_window_select_and_ramp(param_1, scratch + RECON_3D_ROW_ARRAY,
                                 scratch + 10u * RECON_3D_ROW_ARRAY,
                                 &nodes[count_nodes], param_4, until, -1, flag);
+            if (gpu3d_raster_has_opaque_unmarked_edges(p2, flag_core, flag)) {
+                uint32_t first_y = limit0 > param_4 ? limit0 : param_4;
+                flag |= gpu3d_raster_unfilled_left(scratch, RECON_3D_ROW_ARRAY, nodes,
+                                                  count_nodes, first_y, width, height);
+            }
 
             uint32_t min = param_4 < limit0 ? param_4 : limit0;
             uint32_t n = clip + param_4 + limit0 - min - height;
@@ -1341,6 +1449,8 @@ L_4: ;
     }
 
 L607b4_join: ;
+    if (param8 & GPU3D_SPAN_SKIP_LEFT)
+        local_cnt = gpu3d_raster_clip_unfilled_left(pcVar33, p2, param5, local_cnt);
 
     uint32_t uVar29 = p3->polygon_attr;
     uint32_t uVar5  = uVar29;
@@ -2800,6 +2910,9 @@ void gpu3d_raster_span_band_compose_dispatch_hires(uint8_t *state, uint8_t *entr
             }
         }
     }
+
+    if (flags & GPU3D_SPAN_SKIP_LEFT)
+        state_line = gpu3d_raster_clip_unfilled_left(marks, entry, width, state_line);
 
     control = order->polygon_attr;
 
