@@ -350,6 +350,7 @@ void gpu3d_raster_band_bucket_classify_hires(gpu3d_t *machine, gpu3d_band_bucket
 void gpu3d_raster_bands_group_runs(uint8_t *a0, unsigned char *base, const gpu3d_polygon_t *a2, uint8_t *a3, int cursor_start, int count, uint32_t flag, const gpu3d_bank_vertex_t *a7);
 void gpu3d_raster_bands_prepare_blocks(void *param_1, void *param_2, uint32_t param_3);
 void gpu3d_raster_block_summarize_and_delta(gpu3d_t *a, unsigned char *b);
+enum { GPU3D_RAMP_MARKED_OPAQUE = 0x100u };
 void gpu3d_raster_line_window_select_and_ramp(uint8_t *param_1, void *param_2, void *param_3, const gpu3d_bank_vertex_t *const *param_4, uint32_t param_5, uint32_t param_6, int32_t param_7, uint64_t param_8);
 void gpu3d_raster_band_compose_fog_alpha(unsigned char *machine, unsigned char *dest, uint32_t row);
 void gpu3d_raster_band_compose_fogged(unsigned char *machine, unsigned char *dest, uint32_t row);

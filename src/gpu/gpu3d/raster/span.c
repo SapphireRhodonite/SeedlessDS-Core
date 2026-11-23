@@ -230,13 +230,16 @@ void gpu3d_raster_span_edge_ramp_dispatch(uint8_t *param_1, const gpu3d_polygon_
             uint32_t boolp5 = (param_5 < uVar18s) ? 1u : 0u;
             uint32_t uVar17b = uVar17 + boolp5;
             uint32_t iVar23 = uVar26 + bVar8 + boolp5;
+            uint32_t marked_flag = uVar21;
+            if (((param_2->polygon_attr >> 16) & 0x1fu) == 0x1fu)
+                marked_flag |= GPU3D_RAMP_MARKED_OPAQUE;
             gpu3d_raster_line_window_select_and_ramp(param_1, scratch + 0x000u,
                                 scratch + 0x6e0u,
-                                local_b8, iVarY15, uVar17b, 1, uVar21);
+                                local_b8, iVarY15, uVar17b, 1, marked_flag);
             gpu3d_raster_line_window_select_and_ramp(param_1, scratch + 0x0b0u,
                                 scratch + 0x6e0u,
                                 &local_b8[uVar19],
-                                iVarY15, uVar17b, -1, uVar21);
+                                iVarY15, uVar17b, -1, marked_flag);
 
             if (iVar23 != 0) {
                 uint32_t clip2b = (param_4 < uVar28) ? param_4 : uVar28;
@@ -709,12 +712,15 @@ void gpu3d_raster_span_edge_ramp_dispatch_hires(uint8_t *param_1, const gpu3d_po
         uint32_t extra = param_5 < height;
         uint32_t until2 = until + extra;
         uint32_t total = width + smaller + extra;
+        uint32_t marked_flag = flag;
+        if (((param_2->polygon_attr >> 16) & 0x1fu) == 0x1fu)
+            marked_flag |= GPU3D_RAMP_MARKED_OPAQUE;
         gpu3d_raster_line_window_select_and_ramp(param_1, scratch,
                             scratch + 10u * RECON_3D_ROW_ARRAY, nodes,
-                            len, until2, 1, flag);
+                            len, until2, 1, marked_flag);
         gpu3d_raster_line_window_select_and_ramp(param_1, scratch + RECON_3D_ROW_ARRAY,
                             scratch + 10u * RECON_3D_ROW_ARRAY,
-                            &nodes[count_nodes], len, until2, -1, flag);
+                            &nodes[count_nodes], len, until2, -1, marked_flag);
 
         if (total != 0) {
             uint32_t min = param_4 < limit0 ? param_4 : limit0;

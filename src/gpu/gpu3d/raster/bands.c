@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include "hires_runtime.h"
@@ -37,11 +38,65 @@ static inline uint32_t table_u32(const unsigned char *table_base, int64_t span)
     return v;
 }
 
+#define RASTER_X_FRACTION_BITS 18
+#define RASTER_X_ONE (1u << RASTER_X_FRACTION_BITS)
+
+typedef struct {
+    int32_t start;
+    int32_t step;
+    int32_t min_x;
+    int32_t max_x;
+} marked_x_major_ramp_t;
+
+static marked_x_major_ramp_t marked_x_major_ramp(uint16_t first_x, uint16_t last_x,
+                                                unsigned delta_y, unsigned row, int direction)
+{
+    marked_x_major_ramp_t ramp = {0};
+    int32_t delta_x = (int32_t)last_x - first_x;
+    bool negative = delta_x < 0;
+    unsigned distance = (unsigned)(negative ? -delta_x : delta_x);
+    if (distance <= delta_y)
+        return ramp;
+
+    unsigned increment = distance * (RASTER_X_ONE / delta_y);
+    if (increment <= RASTER_X_ONE)
+        return ramp;
+
+    bool right = direction < 0;
+    unsigned half = RASTER_X_ONE / 2;
+    unsigned phase = right == negative ? half : increment - half;
+    phase += row * increment;
+
+    int32_t origin = (int32_t)((uint32_t)first_x << RASTER_X_FRACTION_BITS);
+    if (negative) {
+        ramp.start = origin - (int32_t)phase - 1;
+        ramp.step = -(int32_t)increment;
+        ramp.min_x = last_x;
+        ramp.max_x = first_x - 1;
+    } else {
+        ramp.start = origin + (int32_t)phase;
+        ramp.step = (int32_t)increment;
+        ramp.min_x = first_x;
+        ramp.max_x = last_x - 1;
+    }
+    return ramp;
+}
+
+static uint16_t marked_x_major_endpoint(marked_x_major_ramp_t *ramp)
+{
+    int32_t x = ramp->start >> RASTER_X_FRACTION_BITS;
+    ramp->start += ramp->step;
+    if (x < ramp->min_x) x = ramp->min_x;
+    if (x > ramp->max_x) x = ramp->max_x;
+    return (uint16_t)x;
+}
+
 void gpu3d_raster_line_window_select_and_ramp(uint8_t *param_1, void *param_2, void *param_3,
                          const gpu3d_bank_vertex_t *const *param_4, uint32_t param_5, uint32_t param_6,
                          int32_t param_7, uint64_t param_8)
 {
     (void)param_1;
+    bool marked_opaque = (param_8 & GPU3D_RAMP_MARKED_OPAQUE) != 0;
     unsigned char *ctx  = param_2;
 
     const gpu3d_bank_vertex_t *pairs[2 * MAX_MATCHES];
@@ -124,8 +179,13 @@ void gpu3d_raster_line_window_select_and_ramp(uint8_t *param_1, void *param_2, v
                 uint32_t acc = base0 + ((uint32_t)a4 << 18);
                 uint32_t flag_scaled = flag_eq4 << 15;
 
+                marked_x_major_ramp_t ramp = {0};
+                if (marked_opaque)
+                    ramp = marked_x_major_ramp(a4, b4, (unsigned)span, j == 0 ? lead_gap : 0, param_7);
                 for (uint32_t i = 0; i < W; i++) {
                     uint16_t val = (uint16_t)(flag_scaled | (acc >> 18));
+                    if (ramp.step != 0)
+                        val = marked_x_major_endpoint(&ramp);
                     memcpy(dst1, &val, sizeof(val));
                     dst1 += 2;
                     acc += step;
@@ -184,9 +244,14 @@ void gpu3d_raster_line_window_select_and_ramp(uint8_t *param_1, void *param_2, v
                 uint32_t acc1 = acc1_base;
                 uint64_t acc2 = acc2_base;
 
+                marked_x_major_ramp_t ramp = {0};
+                if (marked_opaque)
+                    ramp = marked_x_major_ramp(a4, b4, (unsigned)span, j == 0 ? lead_gap : 0, param_7);
                 for (uint32_t i = 0; i < W; i++) {
                     uint16_t v1 = (uint16_t)(flag_scaled | (acc1 >> 18));
                     uint32_t v2 = (uint32_t)(acc2 >> 30);
+                    if (ramp.step != 0)
+                        v1 = marked_x_major_endpoint(&ramp);
                     memcpy(dst1, &v1, sizeof(v1));
                     memcpy(dst2, &v2, sizeof(v2));
                     dst1 += 2;
@@ -199,6 +264,8 @@ void gpu3d_raster_line_window_select_and_ramp(uint8_t *param_1, void *param_2, v
     }
 
 }
+#undef RASTER_X_ONE
+#undef RASTER_X_FRACTION_BITS
 #undef OFF_TABLE
 #undef OFF_CALL_A
 #undef OFF_CALL_B
