@@ -418,7 +418,35 @@ static int dispatch_hires_raster(gpu_t *gpu, uint32_t mode, int defer) {
         g = (unsigned char *)gpu->vram.config;
         uint32_t batch = *(uint32_t *)(g + 1180);
         boss_hdr->pass = (uint8_t)batch;
-        uint32_t threads = recon_threads_3d(*(uint32_t *)(g + 1168));
+        unsigned requested = *(uint32_t *)(g + 1168);
+        unsigned threads = recon_threads_3d(requested);
+        static __thread unsigned parallel_draws;
+        static __thread uint32_t previous_draw;
+        static __thread int previous_draw_slow;
+        uint64_t raster_start = 0;
+        unsigned budget = 0;
+        if (threads > 2u && recon_scale_3d == 2u && RECON_BANDS == 12u
+            && recon_dynamic_share()) {
+            if (requested > 4u) {
+                uint64_t frame_budget = raster_frame_budget();
+                uint32_t frame = (uint32_t)(frame_budget >> 32);
+                budget = (uint32_t)frame_budget;
+                if (frame - previous_draw == 2u) budget *= 2u;
+                previous_draw = frame;
+            }
+            if (budget && !parallel_draws) {
+                threads = 1u;
+                raster_start = time_monotonic_microseconds();
+            } else {
+                if (parallel_draws) parallel_draws--;
+                if (defer) {
+                    unsigned occupied = 0;
+                    for (unsigned band = 0; band < 12u && occupied < 4u; ++band)
+                        occupied += (gpu->bucket[0][band].count | gpu->bucket[1][band].count) != 0;
+                    if (occupied < 4u) threads = 2u;
+                }
+            }
+        }
 
         int deferred = defer && threads > 1u && recon_scale_3d >= 2u
             && (state->disp3dcnt & 0x4000u) == 0u;
@@ -428,6 +456,7 @@ static int dispatch_hires_raster(gpu_t *gpu, uint32_t mode, int defer) {
             && recon_tables_base(machine) != gpu->frame[0]);
         boss_hdr->threads = (uint8_t)threads;
         recon_band_reset();
+        recon_band_prioritize(gpu, threads);
         if (threads > 1) {
             gpu3d_band_header_t *w = GPU3D_BAND_HEADER(C0 + BLK);
             uint64_t left = (uint64_t)threads - 2;
@@ -453,6 +482,15 @@ static int dispatch_hires_raster(gpu_t *gpu, uint32_t mode, int defer) {
             return 1;
         }
         finish_hires_raster(gpu, threads, -1);
+        if (raster_start) {
+            uint64_t duration = time_monotonic_microseconds() - raster_start;
+            if (duration > budget && (previous_draw_slow || duration > 2u * (uint64_t)budget)) {
+                parallel_draws = 8u;
+                previous_draw_slow = 0;
+            } else {
+                previous_draw_slow = duration > budget;
+            }
+        }
         return 0;
     }
 

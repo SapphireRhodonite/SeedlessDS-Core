@@ -1,4 +1,5 @@
 #include "core_internals.h"
+#include "gpu/output_color.h"
 #include "hires_runtime.h"
 #include <stdint.h>
 #include <string.h>
@@ -1592,6 +1593,24 @@ static __attribute__((always_inline)) inline void compose_store_capture_sixteen(
     vst1q_u16(capture + 8, vorrq_u16(hi, vshll_n_u8(vget_high_u8(b), 8)));
 }
 
+static int compose_bg0_is_front(const gpu2d_engine_t *e, const uint8_t *buf)
+{
+    if (e->draw_count == 0u || e->draw_count > 8u) return 0;
+    unsigned seen = 0u, before_bg0 = 1u, covered = 0u;
+#pragma clang loop unroll(disable)
+    for (unsigned i = 0; i < e->draw_count; ++i) {
+        unsigned layer = e->draw_order[i];
+        if (layer >= 8u || (seen & (1u << layer))) return 0;
+        seen |= 1u << layer;
+        if (layer == 0u) before_bg0 = 0u;
+        else if (before_bg0) {
+            const uint8_t *mask = buf + 0xda0u + layer * 32u;
+            covered |= vmaxvq_u8(vorrq_u8(vld1q_u8(mask), vld1q_u8(mask + 16u)));
+        }
+    }
+    return (seen & 1u) && !covered;
+}
+
 static __attribute__((noinline)) int compose_capture_opaque_four(
         const gpu2d_engine_t *e, uint8_t *dst, gpu_output_t *cap,
         const recon_b2_prep *p, const uint8_t *three,
@@ -1609,21 +1628,7 @@ static __attribute__((noinline)) int compose_capture_opaque_four(
     if (!p->three || p->extra != 1u || p->lv21 || p->s576 || p->s752
         || p->bright23 || (p->modes_f & 15u) || !(p->flags & 1u)
         || (p->flags & ~31u) || (e->dispcnt & 0xe000u)) return 0;
-    if (e->draw_count == 0u || e->draw_count > 8u) return 0;
-    unsigned seen = 0u, before_bg0 = 1u, covered = 0u;
-#pragma clang loop unroll(disable)
-    for (unsigned i = 0; i < e->draw_count; ++i) {
-        unsigned layer = e->draw_order[i];
-        if (layer >= 8u || (seen & (1u << layer))) return 0;
-        seen |= 1u << layer;
-        if (layer == 0u) before_bg0 = 0u;
-        else if (before_bg0) {
-            const uint8_t *mask = p->buf + 0xda0u + layer * 32u;
-            covered |= vmaxvq_u8(vorrq_u8(vld1q_u8(mask), vld1q_u8(mask + 16u)));
-        }
-    }
-    if (!(seen & 1u) || covered || !cap->capture.source || !cap->capture.shadow)
-        return 0;
+    if (!compose_bg0_is_front(e, p->buf) || !cap->capture.source || !cap->capture.shadow) return 0;
     uint32_t off = (256u * p->line + cap->capture.read_offset) & 0xffffu;
     uint8_t *native = cap->capture.source + (size_t)off * 2u;
     uint8_t *shadow = cap->capture.shadow + (size_t)off * 32u;
@@ -1715,6 +1720,18 @@ uint32_t gpu2d_compose_render_line_body(void *ctx, uint8_t *dst, gpu_output_t *c
                          || (s752 && ((gpu2d_engine_t *)c)->bg[3].direct_ptr_alt);
 
 
+#ifdef __ARM_NEON
+        const gpu2d_engine_t *engine = (const gpu2d_engine_t *)ctx;
+        int single_overlay = nsub == 4u && flags == 1u && extra == 1u && three && !modes_f
+            && !bright23 && !lv21 && !s576 && !s752 && !(engine->dispcnt & 0xe000u)
+            && !compose_ranges_overlap(dst, 0xc00u, three, 0x1000u)
+            && !compose_ranges_overlap(dst, 0xc00u, buf, 0x1c00u)
+            && !compose_ranges_overlap(three, 0x1000u, buf, 0x1c00u)
+            && !compose_ranges_overlap(dst, 0xc00u, ctx, sizeof(*engine))
+            && !compose_ranges_overlap(dst, 0xc00u, p, sizeof(*p))
+            && (!cap || !compose_ranges_overlap(dst, 0xc00u, cap, sizeof(*cap)))
+            && compose_bg0_is_front(engine, buf);
+#endif
         for (uint32_t idx = 0; idx < nsub; idx++) {
 
             if (recon_shortcut_all() && idx > 0 && idx + 1u < nsub) {
@@ -1749,8 +1766,16 @@ uint32_t gpu2d_compose_render_line_body(void *ctx, uint8_t *dst, gpu_output_t *c
 
             gpu2d_compose_clear_masked_groups(ctx, (uint32_t *)(buf + 0xda0), (const uint32_t *)(buf + 0xf00), flags & extra);
 
-            gpu2d_compose_blend_line_windows(ctx, dst + (size_t)idx * 0x300, buf, table,
-                                 p3, p6, flags, m, w16);
+#ifdef __ARM_NEON
+            if (single_overlay && w16 == 16u &&
+                vminvq_u8(vandq_u8(vld1q_u8(buf + 0xda0u), vld1q_u8(buf + 0xdb0u))) == 0xffu) {
+                compose_copy_full_overlay(dst + (size_t)idx * 0x300u, NULL, p3);
+            } else
+#endif
+            {
+                gpu2d_compose_blend_line_windows(ctx, dst + (size_t)idx * 0x300, buf, table,
+                                               p3, p6, flags, m, w16);
+            }
 
             if (!differ && idx > 0
                 && memcmp(dst + (size_t)idx * 0x300, dst, 0x300) != 0)
@@ -2765,6 +2790,17 @@ static const unsigned char ALPHA_4H[16] = {
 
 void gpu2d_compose_extract_alpha_plane_bf00(const unsigned char *pl, unsigned char *dst) {
     for (unsigned g = 0; g < 8; g++) {
+#ifdef __ARM_NEON
+        uint8x16x4_t low, high;
+        for (unsigned channel = 0; channel < 3; ++channel) {
+            const uint8_t *src = pl + channel * PLANE_B;
+            low.val[channel] = vshlq_n_u8(vld1q_u8(src), 2);
+            high.val[channel] = vshlq_n_u8(vld1q_u8(src + 16), 2);
+        }
+        low.val[3] = high.val[3] = vdupq_n_u8(0xff);
+        vst4q_u8(dst, low);
+        vst4q_u8(dst + 64, high);
+#else
         unsigned char p0[32], p1[32], p2[32];
         for (unsigned k = 0; k < 32; k++) {
             p0[k] = pl[k];
@@ -2777,6 +2813,7 @@ void gpu2d_compose_extract_alpha_plane_bf00(const unsigned char *pl, unsigned ch
             dst[4 * k + 2] = (unsigned char)(p2[k] << 2);
             dst[4 * k + 3] = 0xff;
         }
+#endif
         pl += 32;
         dst += 128;
     }
@@ -2850,16 +2887,107 @@ void gpu2d_compose_extract_alpha_plane_bf60(const unsigned char *a, const unsign
 #endif
 }
 
+const uint8_t curve_5_from_6[64] = {
+    0, 4, 5, 7, 8, 9, 10, 10, 11, 12, 12, 13, 13, 14, 15, 15,
+    16, 16, 16, 17, 17, 18, 18, 19, 19, 19, 20, 20, 21, 21, 21, 22,
+    22, 22, 23, 23, 23, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 27,
+    27, 27, 27, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30, 31, 31
+};
+
+const uint8_t curve_6_from_6[64] = {
+    0, 8, 11, 14, 16, 18, 19, 21, 22, 24, 25, 26, 27, 28, 30, 31,
+    32, 33, 33, 34, 35, 36, 37, 38, 39, 39, 40, 41, 42, 42, 43, 44,
+    45, 45, 46, 47, 47, 48, 49, 49, 50, 51, 51, 52, 52, 53, 54, 54,
+    55, 55, 56, 56, 57, 57, 58, 59, 59, 60, 60, 61, 61, 62, 62, 63
+};
+
+const uint8_t curve_5_from_8[256] = {
+    0, 2, 3, 3, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8,
+    8, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 11, 11,
+    11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13,
+    13, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 17, 17,
+    17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19,
+    19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+    21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 22, 22, 22, 22, 22,
+    22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+    23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 26, 26, 26,
+    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27,
+    27, 27, 27, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 31, 31, 31, 31, 31, 31, 31, 31, 31
+};
+
+const uint8_t curve_6_from_8[256] = {
+    0, 4, 6, 7, 8, 9, 10, 10, 11, 12, 12, 13, 14, 14, 15, 15,
+    16, 16, 17, 17, 18, 18, 19, 19, 19, 20, 20, 20, 21, 21, 22, 22,
+    22, 23, 23, 23, 24, 24, 24, 25, 25, 25, 26, 26, 26, 26, 27, 27,
+    27, 28, 28, 28, 28, 29, 29, 29, 30, 30, 30, 30, 31, 31, 31, 31,
+    32, 32, 32, 32, 33, 33, 33, 33, 33, 34, 34, 34, 34, 35, 35, 35,
+    35, 36, 36, 36, 36, 36, 37, 37, 37, 37, 37, 38, 38, 38, 38, 38,
+    39, 39, 39, 39, 39, 40, 40, 40, 40, 40, 41, 41, 41, 41, 41, 42,
+    42, 42, 42, 42, 42, 43, 43, 43, 43, 43, 44, 44, 44, 44, 44, 44,
+    45, 45, 45, 45, 45, 45, 46, 46, 46, 46, 46, 47, 47, 47, 47, 47,
+    47, 48, 48, 48, 48, 48, 48, 48, 49, 49, 49, 49, 49, 49, 50, 50,
+    50, 50, 50, 50, 51, 51, 51, 51, 51, 51, 51, 52, 52, 52, 52, 52,
+    52, 52, 53, 53, 53, 53, 53, 53, 54, 54, 54, 54, 54, 54, 54, 55,
+    55, 55, 55, 55, 55, 55, 56, 56, 56, 56, 56, 56, 56, 56, 57, 57,
+    57, 57, 57, 57, 57, 58, 58, 58, 58, 58, 58, 58, 59, 59, 59, 59,
+    59, 59, 59, 59, 60, 60, 60, 60, 60, 60, 60, 60, 61, 61, 61, 61,
+    61, 61, 61, 61, 62, 62, 62, 62, 62, 62, 62, 63, 63, 63, 63, 63
+};
+
+#ifdef __ARM_NEON
+static inline uint8x16x2_t pack_rgb565_planes(const unsigned char *src, int curve,
+        uint8x16x4_t five, uint8x16x4_t six)
+{
+    if (!curve) {
+        uint8x16_t r = vld1q_u8(src);
+        uint8x16_t g = vld1q_u8(src + PLANE_B);
+        uint8x16_t b = vld1q_u8(src + 2u * PLANE_B);
+        uint8x16x2_t linear;
+        linear.val[0] = vorrq_u8(vshlq_n_u8(g, 5), vandq_u8(vshrq_n_u8(b, 1), vdupq_n_u8(31)));
+        linear.val[1] = vorrq_u8(vandq_u8(vshlq_n_u8(r, 2), vdupq_n_u8(224)), vshrq_n_u8(g, 3));
+        return linear;
+    }
+    uint8x16_t mask = vdupq_n_u8(63);
+    uint8x16_t red = vqtbl4q_u8(five, vandq_u8(vld1q_u8(src), mask));
+    uint8x16_t green = vqtbl4q_u8(six, vandq_u8(vld1q_u8(src + PLANE_B), mask));
+    uint8x16_t blue = vqtbl4q_u8(five, vandq_u8(vld1q_u8(src + 2u * PLANE_B), mask));
+    uint8x16x2_t packed;
+    packed.val[0] = vorrq_u8(vshlq_n_u8(green, 5), blue);
+    packed.val[1] = vorrq_u8(vshlq_n_u8(red, 3), vshrq_n_u8(green, 3));
+    return packed;
+}
+#else
 static void a565(unsigned char r, unsigned char v, unsigned char z,
-                 unsigned char *low, unsigned char *height) {
-    *height = (unsigned char)(((unsigned char)(r << 2) & 0xe0u)
-                            | (unsigned char)(v >> 3));
-    *low = (unsigned char)(((unsigned char)(v << 5) & 0xe0u)
-                            | ((unsigned char)(z >> 1) & 0x1fu));
+                 unsigned char *low, unsigned char *height, int curve) {
+    uint16_t packed = output_rgb565_from_planes(r, v, z, curve);
+    *low = (uint8_t)packed;
+    *height = (uint8_t)(packed >> 8);
 }
 
+#endif
+
 void gpu2d_compose_extract_alpha_plane_bfdc(const unsigned char *pl, unsigned char *dst) {
+    int curve = output_uses_color_curve();
+#ifdef __ARM_NEON
+    uint8x16x4_t five = vld1q_u8_x4(curve_5_from_6);
+    uint8x16x4_t six = vld1q_u8_x4(curve_6_from_6);
+#endif
     for (unsigned g = 0; g < 4; g++) {
+#ifdef __ARM_NEON
+        uint8x16x2_t first = pack_rgb565_planes(pl, curve, five, six);
+        uint8x16x2_t second = pack_rgb565_planes(pl + 16, curve, five, six);
+        uint8x16x2_t third = pack_rgb565_planes(pl + 32, curve, five, six);
+        uint8x16x2_t fourth = pack_rgb565_planes(pl + 48, curve, five, six);
+        vst2q_u8(dst, first);
+        vst2q_u8(dst + 32, second);
+        vst2q_u8(dst + 64, third);
+        vst2q_u8(dst + 96, fourth);
+#else
         unsigned char p0[64], p1[64], p2[64];
         for (unsigned k = 0; k < 64; k++) {
             p0[k] = pl[k];
@@ -2867,7 +2995,8 @@ void gpu2d_compose_extract_alpha_plane_bfdc(const unsigned char *pl, unsigned ch
             p2[k] = pl[2 * PLANE_B + k];
         }
         for (unsigned k = 0; k < 64; k++)
-            a565(p0[k], p1[k], p2[k], &dst[2 * k], &dst[2 * k + 1]);
+            a565(p0[k], p1[k], p2[k], &dst[2 * k], &dst[2 * k + 1], curve);
+#endif
         pl += 64;
         dst += 128;
     }
@@ -2875,7 +3004,22 @@ void gpu2d_compose_extract_alpha_plane_bfdc(const unsigned char *pl, unsigned ch
 
 void gpu2d_compose_extract_alpha_plane_c074(const unsigned char *a, const unsigned char *b,
                              unsigned char *dst) {
+    int curve = output_uses_color_curve();
+#ifdef __ARM_NEON
+    uint8x16x4_t five = vld1q_u8_x4(curve_5_from_6);
+    uint8x16x4_t six = vld1q_u8_x4(curve_6_from_6);
+#endif
     for (unsigned g = 0; g < 8; g++) {
+#ifdef __ARM_NEON
+        uint8x16x2_t even = pack_rgb565_planes(a, curve, five, six);
+        uint8x16x2_t odd = (a == b) ? even : pack_rgb565_planes(b, curve, five, six);
+        uint8x16x2_t even_high = pack_rgb565_planes(a + 16, curve, five, six);
+        uint8x16x2_t odd_high = (a == b) ? even_high : pack_rgb565_planes(b + 16, curve, five, six);
+        uint8x16x4_t low = {{even.val[0], even.val[1], odd.val[0], odd.val[1]}};
+        uint8x16x4_t high = {{even_high.val[0], even_high.val[1], odd_high.val[0], odd_high.val[1]}};
+        vst4q_u8(dst, low);
+        vst4q_u8(dst + 64, high);
+#else
         unsigned char A[3][32], B[3][32];
         for (unsigned c = 0; c < 3; c++)
             for (unsigned k = 0; k < 32; k++) {
@@ -2883,9 +3027,10 @@ void gpu2d_compose_extract_alpha_plane_c074(const unsigned char *a, const unsign
                 B[c][k] = b[c * PLANE_B + k];
             }
         for (unsigned k = 0; k < 32; k++) {
-            a565(A[0][k], A[1][k], A[2][k], &dst[4 * k + 0], &dst[4 * k + 1]);
-            a565(B[0][k], B[1][k], B[2][k], &dst[4 * k + 2], &dst[4 * k + 3]);
+            a565(A[0][k], A[1][k], A[2][k], &dst[4 * k + 0], &dst[4 * k + 1], curve);
+            a565(B[0][k], B[1][k], B[2][k], &dst[4 * k + 2], &dst[4 * k + 3], curve);
         }
+#endif
         a += 32;
         b += 32;
         dst += 128;

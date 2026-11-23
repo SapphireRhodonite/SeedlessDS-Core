@@ -90,7 +90,9 @@ void gpu2d_line_finish_work(uint8_t *shadow, recon_b2_job *t);
 #define RECON_SCREEN_BYTES ((unsigned long)0x30000ul * recon_scale_out * recon_scale_out)
 #define RECON_PAGE_PAIR_BYTES ((unsigned long)0x60000ul * recon_scale_pages * recon_scale_pages)
 
+struct gpu;
 void     recon_band_reset(void);
+void     recon_band_prioritize(const struct gpu *gpu, unsigned threads);
 unsigned recon_band_take(void);
 int      recon_dynamic_share(void);
 void     recon_band_publish(unsigned band, unsigned dirty);
@@ -102,6 +104,7 @@ unsigned recon_band_sibling_dirty(unsigned band);
 #define RECON_HIRES_THREADS  8u
 extern unsigned recon_threads_created;
 unsigned recon_threads_3d(unsigned requested);
+uint64_t raster_frame_budget(void);
 
 extern unsigned recon_bands_n;
 extern unsigned recon_bands_map;

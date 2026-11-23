@@ -12,6 +12,13 @@
 #include "seedlessds/control.h"
 #include "wifi/wifi_core.h"
 
+static uint64_t raster_budget;
+
+uint64_t raster_frame_budget(void)
+{
+    return __atomic_load_n(&raster_budget, __ATOMIC_RELAXED);
+}
+
 static int early_input_pacing;
 static uint64_t early_wait_ticks;
 static uint64_t early_wait_base;
@@ -93,6 +100,7 @@ void pacer_init(unsigned char *ctx)
     g->pacer_accumulated = 0;
     frame_budget.owner = NULL;
     wireless_wait_deadline = 0;
+    __atomic_store_n(&raster_budget, 0u, __ATOMIC_RELAXED);
     early_wait_ticks = 0;
     input_work_reset();
 }
@@ -241,6 +249,12 @@ void pacer_run(uint8_t *ctx) {
     ref -= prepaid;
 
     uint64_t acc = g->pacer_accumulated + step;
+    uint32_t budget_us = 0;
+    if (!p->fast_forward && !((nds_t *)ctx)->benchmark.enabled && !wifi_core_active()
+        && (int32_t)((uint32_t)acc - (uint32_t)ref) >= -(int32_t)step)
+        budget_us = step / 4u;
+    uint64_t frame = ((nds_t *)ctx)->sched.frame;
+    __atomic_store_n(&raster_budget, (frame << 32) | budget_us, __ATOMIC_RELAXED);
     g->pacer_accumulated = acc;
 
     if (client_pacing) {

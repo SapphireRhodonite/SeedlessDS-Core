@@ -508,6 +508,13 @@ void gpu3d_raster_pixel_alpha_max(uint8_t *param_1, const uint8_t *param_2,
     int32_t        n  = param_3;
 
     do {
+#ifdef __ARM_NEON
+        uint8x16x4_t color = vld4q_u8(p0);
+        uint8x16_t lower = vandq_u8(vld4q_u8(p1).val[3], vdupq_n_u8(31));
+        vst1q_u8(p3, color.val[3]);
+        color.val[3] = vmaxq_u8(color.val[3], lower);
+        vst4q_u8(p0, color);
+#else
 
         uint8_t r0[16], g0[16], b0[16], a0[16];
         uint8_t a1m[16];
@@ -532,6 +539,7 @@ void gpu3d_raster_pixel_alpha_max(uint8_t *param_1, const uint8_t *param_2,
             p0[i * 4 + 2] = b0[i];
             p0[i * 4 + 3] = newA;
         }
+#endif
 
         p0 += 64;
         p1 += 64;
@@ -714,6 +722,17 @@ void gpu3d_raster_rows_copy_table(unsigned char *dst, unsigned char *src,
     } while (--rows != 0);
 }
 
+static inline void copy_eight_pixels(void *dst, const void *src, size_t element_size)
+{
+    size_t bytes = 8 * element_size;
+    if ((uintptr_t)dst - (uintptr_t)src >= bytes) {
+        memmove(dst, src, bytes);
+    } else {
+        for (size_t offset = 0; offset < bytes; offset += element_size)
+            memmove((unsigned char *)dst + offset, (const unsigned char *)src + offset, element_size);
+    }
+}
+
 void gpu3d_raster_rows_copy_table_triple(uint32_t *d0, uint32_t *d1, unsigned char *d2,
                         const uint32_t *s0, const uint32_t *s1,
                         const unsigned char *s2,
@@ -733,9 +752,9 @@ void gpu3d_raster_rows_copy_table_triple(uint32_t *d0, uint32_t *d1, unsigned ch
         uint32_t *q0 = d0, *q1 = d1;
         unsigned char *q2 = d2;
         do {
-            for (int k = 0; k < 8; k++) q1[k] = p1[k];
-            for (int k = 0; k < 8; k++) q0[k] = p0[k];
-            for (int k = 0; k < 8; k++) q2[k] = p2[k];
+            copy_eight_pixels(q1, p1, sizeof *q1);
+            copy_eight_pixels(q0, p0, sizeof *q0);
+            copy_eight_pixels(q2, p2, sizeof *q2);
             p0 += 8; p1 += 8; p2 += 8;
             q0 += 8; q1 += 8; q2 += 8;
             n -= 8;
@@ -959,9 +978,9 @@ void gpu3d_raster_rows_copy_fixed_triple_256(uint32_t *d0, uint32_t *d1, unsigne
     do {
         int32_t n = (int32_t)width;
         do {
-            for (int k = 0; k < 8; k++) d1[k] = s1[k];
-            for (int k = 0; k < 8; k++) d0[k] = s0[k];
-            for (int k = 0; k < 8; k++) d2[k] = s2[k];
+            copy_eight_pixels(d1, s1, sizeof *d1);
+            copy_eight_pixels(d0, s0, sizeof *d0);
+            copy_eight_pixels(d2, s2, sizeof *d2);
             s1 += 8; s0 += 8; s2 += 8;
             d1 += 8; d0 += 8; d2 += 8;
             n -= 8;

@@ -5,6 +5,9 @@
 #include <string.h>
 #include "core_internals.h"
 #include "mem_access.h"
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 
 
@@ -2032,12 +2035,26 @@ void gpu2d_bg_text_pack_blend_window_wide(uint16_t *out_px, uint8_t *out_height,
 #define TILES   33
 #define GROUPS  8
 
-static uint32_t flip(uint32_t d) {
-    uint32_t r = 0;
-    for (int p = 0; p < 8; p++) r |= ((d >> (4 * (7 - p))) & 0xfu) << (4 * p);
-    return r;
+static uint32_t flip_4bpp_row(uint32_t row) {
+    uint32_t swapped = ((row & 0x0f0f0f0fu) << 4) | ((row >> 4) & 0x0f0f0f0fu);
+    return __builtin_bswap32(swapped);
 }
 
+static inline void write_4bpp_tile_colors(uint8_t *dst, const uint8_t *palette, uint32_t row)
+{
+#if defined(__AARCH64EL__) && defined(__ARM_NEON)
+    uint8x8_t bytes = vcreate_u8(row);
+    uint8x8_t indices = vzip1_u8(vand_u8(bytes, vdup_n_u8(15)), vshr_n_u8(bytes, 4));
+    uint8x16x2_t table = vld2q_u8(palette);
+    uint8x8x2_t colors = {{vqtbl1_u8(table.val[0], indices), vqtbl1_u8(table.val[1], indices)}};
+    vst2_u8(dst, colors);
+#else
+    for (unsigned pixel = 0; pixel < 8; ++pixel) {
+        unsigned index = (row >> (4 * pixel)) & 15u;
+        memcpy(dst + 2 * pixel, palette + 2 * index, 2);
+    }
+#endif
+}
 
 void gpu2d_bg_text_decode_4bpp_line(uint8_t *out_color, uint8_t *out_idx,
                         const uint8_t *palettes, const uint8_t *tiledata,
@@ -2049,7 +2066,7 @@ void gpu2d_bg_text_decode_4bpp_line(uint8_t *out_color, uint8_t *out_idx,
 
         for (int t = 0; t < 4; t++) {
             uint32_t d = rd32_at(tiledata, map[v * 4 + t]);
-            if (attr & (4u << (8 * t))) d = flip(d);
+            if (attr & (4u << (8 * t))) d = flip_4bpp_row(d);
             data[t] = d;
         }
 
@@ -2058,11 +2075,8 @@ void gpu2d_bg_text_decode_4bpp_line(uint8_t *out_color, uint8_t *out_idx,
 
         for (int t = 0; t < 4; t++) {
             const uint8_t *pal = palettes + (((attr >> (8 * t + 4)) & 0xfu) << 5);
-            for (int p = 0; p < 8; p++) {
-                unsigned idx = (data[t] >> (4 * p)) & 0xfu;
-                memcpy(out_color, pal + idx * 2, 2);
-                out_color += 2;
-            }
+            write_4bpp_tile_colors(out_color, pal, data[t]);
+            out_color += 16;
         }
     }
 
@@ -2070,18 +2084,14 @@ void gpu2d_bg_text_decode_4bpp_line(uint8_t *out_color, uint8_t *out_idx,
         uint32_t attr = attrs[GROUPS];
         uint32_t d = rd32_at(tiledata, map[GROUPS * 4]);
 
-        uint32_t w0 = (attr & 0x00000004u) ? flip(d) : d;
-        uint32_t w1 = (attr & 0x00000400u) ? flip(d) : d;
+        uint32_t w0 = (attr & 0x00000004u) ? flip_4bpp_row(d) : d;
+        uint32_t w1 = (attr & 0x00000400u) ? flip_4bpp_row(d) : d;
 
         memcpy(out_idx,     &w0, 4);
         memcpy(out_idx + 4, &w1, 4);
 
         const uint8_t *pal = palettes + (((attr >> 4) & 0xfu) << 5);
-        for (int p = 0; p < 8; p++) {
-            unsigned idx = (w0 >> (4 * p)) & 0xfu;
-            memcpy(out_color, pal + idx * 2, 2);
-            out_color += 2;
-        }
+        write_4bpp_tile_colors(out_color, pal, w0);
     }
 }
 #undef TILES
@@ -2091,10 +2101,10 @@ void gpu2d_bg_text_decode_4bpp_line(uint8_t *out_color, uint8_t *out_idx,
 
 static void un_tile(uint8_t *output, const uint8_t *tiledata, uint16_t entry,
                     int flip) {
-    uint8_t d[8];
-    memcpy(d, tiledata + entry, 8);
-    for (int p = 0; p < 8; p++)
-        output[p] = flip ? d[7 - p] : d[p];
+    uint64_t row;
+    memcpy(&row, tiledata + entry, sizeof(row));
+    if (flip) row = __builtin_bswap64(row);
+    memcpy(output, &row, sizeof(row));
 }
 
 void gpu2d_bg_text_decode_8bpp_indices_line(uint8_t *output, const uint8_t *tiledata,
@@ -2153,9 +2163,6 @@ void gpu2d_bg_text_decode_8bpp_line(uint8_t *output, const uint8_t *tiledata,
 #undef TILES
 #undef GROUPS
 
-#ifdef __ARM_NEON
-#include <arm_neon.h>
-#endif
 #include <stdint.h>
 #include "hires_runtime.h"
 #define INPUT 136

@@ -1,4 +1,5 @@
 #include "core_internals.h"
+#include "gpu/output_color.h"
 #include <stdint.h>
 #include <string.h>
 #include "hires_runtime.h"
@@ -158,30 +159,49 @@ static uint32_t channel(uint32_t s) {
     return ((s >> 14) & 0xfcu) | (((s >> 8) & 0x3fu) << 10) | ((s & 0x3fu) << 18);
 }
 
-static uint16_t blend(const uint8_t *pl, uint32_t i, uint32_t mult, uint32_t sum) {
+
+
+static uint16_t blend(const uint8_t *pl, uint32_t i, uint32_t mult, uint32_t sum, int curve) {
     uint32_t r = mult * pl[i] + sum;
     uint32_t g = mult * pl[PLANE + i] + sum;
     uint32_t b = mult * pl[2 * PLANE + i] + sum;
-    return (uint16_t)(((r << 5) & 0xf800u) | (g & 0xffe0u) | (b >> 6));
+    if (!curve) return (uint16_t)(((r << 5) & 0xf800u) | (g & 0xffe0u) | (b >> 6));
+    return (uint16_t)((curve_5_from_6[(r >> 5) & 63] << 11)
+                    | (curve_6_from_6[(g >> 5) & 63] << 5)
+                    | curve_5_from_6[(b >> 5) & 63]);
+}
+
+static uint16_t blend_wide_rgb565(const uint8_t *pl, uint32_t i, uint32_t mult, uint32_t sum, int curve)
+{
+    if (!curve) return blend(pl, i, mult, sum, 0);
+    uint16_t r = (uint16_t)((uint8_t)(pl[i] << 2) * (uint8_t)mult + sum);
+    uint16_t g = (uint16_t)((uint8_t)(pl[PLANE + i] << 2) * (uint8_t)mult + sum);
+    uint16_t b = (uint16_t)((uint8_t)(pl[2 * PLANE + i] << 2) * (uint8_t)mult + sum);
+    unsigned red = curve_5_from_8[(uint8_t)(r >> 5)];
+    unsigned green = curve_6_from_8[(uint8_t)(g >> 5)];
+    unsigned blue = curve_5_from_8[(uint8_t)(b >> 5)];
+    return (uint16_t)((red << 11) | (green << 5) | blue);
 }
 
 static void fade(uint8_t *dst, const uint8_t *a, const uint8_t *b,
                     uint32_t mult, uint32_t sum) {
+    int curve = output_uses_color_curve();
     for (uint32_t i = 0; i < WIDTH; i++) {
         if (b) {
-            wr16(dst + (size_t)i * 4,     blend(a, i, mult, sum));
-            wr16(dst + (size_t)i * 4 + 2, blend(b, i, mult, sum));
+            wr16(dst + (size_t)i * 4,     blend_wide_rgb565(a, i, mult, sum, curve));
+            wr16(dst + (size_t)i * 4 + 2, blend_wide_rgb565(b, i, mult, sum, curve));
         } else {
-            wr16(dst + (size_t)i * 2, blend(a, i, mult, sum));
+            wr16(dst + (size_t)i * 2, blend(a, i, mult, sum, curve));
         }
     }
 }
 #define MAX_SCALE    8u
 #define MAX_GROUPS (MAX_SCALE * MAX_SCALE)
 
-static void a565_local(uint8_t r, uint8_t v, uint8_t z, uint8_t *low, uint8_t *height) {
-    *height = (uint8_t)(((uint8_t)(r << 2) & 0xe0u) | (uint8_t)(v >> 3));
-    *low = (uint8_t)(((uint8_t)(v << 5) & 0xe0u) | ((uint8_t)(z >> 1) & 0x1fu));
+static void a565_local(uint8_t r, uint8_t v, uint8_t z, uint8_t *low, uint8_t *height, int curve) {
+    uint16_t packed = output_rgb565_from_planes(r, v, z, curve);
+    *low = (uint8_t)packed;
+    *height = (uint8_t)(packed >> 8);
 }
 
 #ifdef __ARM_NEON
@@ -377,6 +397,7 @@ static void row_n(uint8_t *dst, uint8_t *const *g, unsigned n, unsigned ef,
         return;
     }
 
+    int curve = bpp == 2 && output_uses_color_curve();
     unsigned jf = 0, rep = 0;
     for (unsigned j = 0; j < WIDTH * n; j++) {
         const uint8_t *p;
@@ -392,13 +413,10 @@ static void row_n(uint8_t *dst, uint8_t *const *g, unsigned n, unsigned ef,
             uint16_t v;
             if (merge) {
 
-                uint32_t rr = mult * c0 + sum;
-                uint32_t gg = mult * c1 + sum;
-                uint32_t bb = mult * c2 + sum;
-                v = (uint16_t)(((rr << 5) & 0xf800u) | (gg & 0xffe0u) | (bb >> 6));
+                v = blend_wide_rgb565(p, 0, mult, sum, curve);
             } else {
                 uint8_t height, low;
-                a565_local((uint8_t)c0, (uint8_t)c1, (uint8_t)c2, &low, &height);
+                a565_local((uint8_t)c0, (uint8_t)c1, (uint8_t)c2, &low, &height, curve);
                 v = (uint16_t)(low | ((uint32_t)height << 8));
             }
             wr16(dst + (size_t)j * 2, v);

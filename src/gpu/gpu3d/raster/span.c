@@ -3303,27 +3303,23 @@ void *gpu3d_raster_span_value_over_mask_array(uint8_t *mask, const uint32_t *thr
 {
 
 #ifdef __ARM_NEON
-    {
-        uint16x4_t acc = vdup_n_u16(0);
-        uint8_t *out = mask;
-        const uint32_t *pv = values, *pu = thresholds;
-        int32_t w3 = n - 8;
-        uint8x8_t m = depth_compare_eight(pv, pu);
-        pv += 8; pu += 8;
-        vst1_u8(out, m); out += 8;
-        while (w3 > 0) {
-            acc = vpadal_u8(acc, vshr_n_u8(m, 7));
-            m = depth_compare_eight(pv, pu);
-            pv += 8; pu += 8;
-            vst1_u8(out, m); out += 8;
-            w3 -= 8;
-        }
-        int64_t bits = (int64_t)(-w3) * 8;
-        uint64x1_t d = vshl_u64(vreinterpret_u64_u8(m), vdup_n_s64(bits));
-        acc = vpadal_u8(acc, vshr_n_u8(vreinterpret_u8_u64(d), 7));
-        *count = vaddlv_u16(acc);
-        return out;
+    int16x4_t totals = vdup_n_s16(0);
+    while (n > 8) {
+        uint8x8_t group = depth_compare_eight(values, thresholds);
+        vst1_u8(mask, group);
+        totals = vpadal_s8(totals, vreinterpret_s8_u8(group));
+        values += 8;
+        thresholds += 8;
+        mask += 8;
+        n -= 8;
     }
+    uint8x8_t last = depth_compare_eight(values, thresholds);
+    vst1_u8(mask, last);
+    int64_t shift = (8LL - n) * 8;
+    uint64x1_t valid = vshl_u64(vreinterpret_u64_u8(last), vdup_n_s64(shift));
+    totals = vpadal_s8(totals, vreinterpret_s8_u64(valid));
+    *count = vaddlv_u16(vreinterpret_u16_s16(vneg_s16(totals)));
+    return mask + 8;
 #else
 
     uint8_t mask_cur[8];

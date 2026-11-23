@@ -12,6 +12,7 @@
 #include "frontend/script/script_io.h"
 #include "seedlessds/platform.h"
 #include "core_internals.h"
+#include "gpu/output_color.h"
 #include "mem_access.h"
 #include "seedlessds/control.h"
 
@@ -764,6 +765,7 @@ void video_out_dump_screen_rgb565(void *dest, unsigned int screen) {
     uint32_t row;
 
     if (video_out_pixel_size() == 2u) {
+        int curve = output_uses_color_curve();
         uint32_t pal = line >> 1;
         for (row = 0; row != ROWS; row++) {
             uint32_t idx = 0;
@@ -771,7 +773,7 @@ void video_out_dump_screen_rgb565(void *dest, unsigned int screen) {
             do {
                 uint16_t v = rd16(src + (uint64_t)idx * 2u);
                 idx += step;
-                wr16(dst + off, v);
+                wr16(dst + off, curve ? output_curve_to_rgb565(v) : v);
                 off += 2u;
             } while (off != ROW_BYTES);
             src += (uint64_t)pal * 2u;

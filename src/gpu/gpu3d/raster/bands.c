@@ -2687,6 +2687,18 @@ static unsigned pair_can_fog(gpu_t *table, gpu3d_t *state, uint32_t side, uint32
     return 0u;
 }
 
+static uint32_t raster_band_polygons(uint8_t *ctx, const gpu3d_band_bucket_t *bucket,
+                                     const gpu3d_polygon_list_t *polygons, const gpu3d_bank_vertex_t *vertices,
+                                     uint32_t start, uint32_t end)
+{
+    const uint32_t count = bucket->count;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint16_t index = rd16(bucket->list + i * 2u);
+        gpu3d_raster_span_edge_ramp_dispatch_hires(ctx, &polygons->polygon[index], vertices, start, end);
+    }
+    return count;
+}
+
 void gpu3d_raster_band_pending_process(void *param_1)
 {
 
@@ -2702,9 +2714,14 @@ void gpu3d_raster_band_pending_process(void *param_1)
     uint32_t side = (uint32_t)(state->bank ^ 1u);
     gpu3d_bank_vertex_t *params_list = state->vertex_bank[side].vertex;
     uint32_t batches = width == 0u ? 0u : RECON_BANDS / (uint32_t)width;
+    const gpu3d_band_bucket_t *opaque = recon_buckets((uint8_t *)table, 0);
+    const gpu3d_band_bucket_t *translucent = recon_buckets((uint8_t *)table, 1);
 
     _Alignas(16) uint8_t tmp[8u * 256u];
 
+    unsigned bands_processed = 0;
+    unsigned band_mask = 0;
+    unsigned long polygons_processed = 0;
     const int dynamic = recon_dynamic_share() && width > 1u;
     uint32_t turn = 0u;
     do {
@@ -2724,8 +2741,8 @@ void gpu3d_raster_band_pending_process(void *param_1)
         recon_band_current = (dynamic && RECON_BANDS == 24u) ? idx : 0xffffu;
         uint32_t start = idx * RECON_BAND_ROWS;
         uint32_t end = start + RECON_BAND_ROWS;
-        recon_bands_n++;
-        recon_bands_map |= 1u << (idx & 31u);
+        ++bands_processed;
+        band_mask |= 1u << (idx & 31u);
 
         gpu3d_raster_band_attr_tables_build_wide(ctx, start, RECON_BAND_ROWS);
 
@@ -2736,23 +2753,8 @@ void gpu3d_raster_band_pending_process(void *param_1)
             memset(ctx + RECON_3D_PLANE2 + RECON_PLANE2_USED, 0xff,
                    (size_t)RECON_BAND_ROWS / 8u);
 
-        uint32_t *header_a = &recon_buckets((uint8_t *)table, 0)[idx].count;
-        if (*header_a != 0u) {
-            uint32_t element = 0u;
-            do {
-                uint8_t *list = recon_buckets((uint8_t *)table, 0)[idx].list;
-                uint16_t entry = rd16(list + (uintptr_t)element * 2u);
-
-                gpu3d_polygon_t *dest = &state->opaque[side].polygon[entry];
-                gpu3d_raster_span_edge_ramp_dispatch_hires(ctx, dest,
-                                               params_list, start, end);
-                recon_poly_band++;
-                ++element;
-            } while (element < *header_a);
-        }
-
-        uint32_t *active_b = &state->translucent[side].count;
-        if (*active_b != 0u) {
+        polygons_processed += raster_band_polygons(ctx, &opaque[idx], &state->opaque[side], params_list, start, end);
+        if (state->translucent[side].count != 0u) {
 
             for (uint32_t offset = 0u;
                  offset != RECON_PLANE2_USED;
@@ -2761,19 +2763,7 @@ void gpu3d_raster_band_pending_process(void *param_1)
                                           0xff, RECON_3D_WIDTH);
             }
 
-            uint32_t *header_b = &recon_buckets((uint8_t *)table, 1)[idx].count;
-            if (*header_b != 0u) {
-                uint32_t element = 0u;
-                do {
-                    uint8_t *list = recon_buckets((uint8_t *)table, 1)[idx].list;
-                    uint16_t entry = rd16(list + (uintptr_t)element * 2u);
-                    gpu3d_polygon_t *dest = &state->translucent[side].polygon[entry];
-                    gpu3d_raster_span_edge_ramp_dispatch_hires(ctx, dest,
-                                                   params_list, start, end);
-                    recon_poly_band++;
-                    ++element;
-                } while (element < *header_b);
-            }
+            polygons_processed += raster_band_polygons(ctx, &translucent[idx], &state->translucent[side], params_list, start, end);
         }
 
         if (dynamic && RECON_BANDS == 24u && pair_can_fog(table, state, side, idx)) {
@@ -2868,4 +2858,10 @@ void gpu3d_raster_band_pending_process(void *param_1)
         }
         ++turn;
     } while (dynamic ? 1 : (turn < batches));
+
+    if (bands_processed) {
+        __atomic_fetch_add(&recon_bands_n, bands_processed, __ATOMIC_RELAXED);
+        __atomic_fetch_or(&recon_bands_map, band_mask, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&recon_poly_band, polygons_processed, __ATOMIC_RELAXED);
+    }
 }

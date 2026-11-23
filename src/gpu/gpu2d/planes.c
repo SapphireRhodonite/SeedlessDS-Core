@@ -1452,7 +1452,33 @@ void gpu2d_planes_average_words32(uint8_t *dest, const uint8_t *source,
 
 #define WIDTH 256
 
+#if defined(__AARCH64EL__) && defined(__ARM_NEON)
+static inline int pack_plane_mask(uint8_t *mask, const uint8_t *pixels, unsigned stride)
+{
+    uintptr_t output = (uintptr_t)mask;
+    uintptr_t input = (uintptr_t)pixels;
+    if (output > input && output - input < WIDTH * stride) return 0;
+
+    const uint8x16_t weights = {1, 2, 4, 8, 16, 32, 64, 128,
+                                1, 2, 4, 8, 16, 32, 64, 128};
+    for (unsigned x = 0; x < WIDTH; x += 64) {
+        uint8x16_t bits[4];
+        for (unsigned group = 0; group < 4; ++group) {
+            const uint8_t *src = pixels + (x + 16 * group) * stride;
+            uint8x16_t values = stride == 1 ? vld1q_u8(src) : vld2q_u8(src).val[0];
+            bits[group] = vbicq_u8(weights, vceqzq_u8(values));
+        }
+        uint8x16_t pairs = vpaddq_u8(vpaddq_u8(bits[0], bits[1]), vpaddq_u8(bits[2], bits[3]));
+        vst1_u8(mask + x / 8, vpadd_u8(vget_low_u8(pairs), vget_high_u8(pairs)));
+    }
+    return 1;
+}
+#endif
+
 void gpu2d_planes_mask_from_bytes(uint8_t *mask, const uint8_t *pixels) {
+#if defined(__AARCH64EL__) && defined(__ARM_NEON)
+    if (pack_plane_mask(mask, pixels, 1)) return;
+#endif
 
     for (int b = 0; b < WIDTH / 8; b++) {
         uint8_t byte = 0;
@@ -1466,6 +1492,9 @@ void gpu2d_planes_mask_from_bytes(uint8_t *mask, const uint8_t *pixels) {
 #define WIDTH 256
 
 void gpu2d_planes_mask_from_pixels_lowbyte(uint8_t *mask, const uint16_t *pixels) {
+#if defined(__AARCH64EL__) && defined(__ARM_NEON)
+    if (pack_plane_mask(mask, (const uint8_t *)pixels, 2)) return;
+#endif
 
     for (int b = 0; b < WIDTH / 8; b++) {
         uint8_t byte = 0;

@@ -11,6 +11,8 @@
 #include "hires_runtime.h"
 #include "seedlessds/control.h"
 #include "core_internals.h"
+#include "gpu/output_color.h"
+#include "mem_access.h"
 
 unsigned long nds_output_reads;
 unsigned long nds_output_frames;
@@ -70,7 +72,7 @@ void nds_control_begin(int64_t clock_seconds, int disable_frameskip, unsigned th
     state.first_geometry = UINT64_MAX;
     capture_seen = UINT64_MAX;
     audio_index = 0;
-    previous_polygons = recon_poly_band;
+    previous_polygons = __atomic_load_n(&recon_poly_band, __ATOMIC_RELAXED);
     __atomic_store_n(&fixed_clock, (long)clock_seconds, __ATOMIC_RELEASE);
     __atomic_store_n(&compose_threads, threads, __ATOMIC_RELEASE);
     __atomic_store_n(&no_frameskip, disable_frameskip != 0, __ATOMIC_RELEASE);
@@ -299,6 +301,17 @@ __attribute__((weak)) int nds_capture_requires_frames(void)
     return __atomic_load_n(&no_frameskip, __ATOMIC_ACQUIRE);
 }
 
+static uint32_t capture_pixel(const unsigned char *p, unsigned bytes)
+{
+    if (bytes == 4) return rd32(p);
+    uint16_t value = rd16(p);
+    if (output_uses_color_curve()) return output_curve_rgb888(value);
+    unsigned r = ((value >> 11) * 255u + 15u) / 31u;
+    unsigned g = (((value >> 5) & 63u) * 255u + 31u) / 63u;
+    unsigned b = ((value & 31u) * 255u + 15u) / 31u;
+    return r | (g << 8) | (b << 16);
+}
+
 __attribute__((weak)) void nds_capture_screens(const void *page, const volatile uint32_t *mode)
 {
     if (!__atomic_load_n(&enabled, __ATOMIC_ACQUIRE)) return;
@@ -318,6 +331,7 @@ __attribute__((weak)) void nds_capture_screens(const void *page, const volatile 
     unsigned scale = recon_native ? recon_scale_output() : 2u;
     if (scale < 1u) scale = 2u;
     uint64_t stride = recon_native ? (uint64_t)RECON_SCREEN_BYTES : UINT64_C(0xC0000);
+    unsigned bytes = video_out_pixel_size();
     unsigned char row[256 * 8 * 3];
     for (unsigned screen = 0; screen < 2 && !state.error; ++screen) {
         unsigned n = mode[screen] ? scale : 1u;
@@ -330,16 +344,20 @@ __attribute__((weak)) void nds_capture_screens(const void *page, const volatile 
         for (unsigned y = 0; y < height && !state.error; ++y) {
             for (unsigned x = 0; x < width; ++x) {
                 if (capture_raw) {
-                    size_t offset = ((size_t)y * width + x) * 4;
-                    row[x * 3] = pixels[offset + 2];
-                    row[x * 3 + 1] = pixels[offset + 1];
-                    row[x * 3 + 2] = pixels[offset];
+                    size_t offset = ((size_t)y * width + x) * bytes;
+                    uint32_t pixel = capture_pixel(pixels + offset, bytes);
+                    row[x * 3] = (unsigned char)(pixel >> 16);
+                    row[x * 3 + 1] = (unsigned char)(pixel >> 8);
+                    row[x * 3 + 2] = (unsigned char)pixel;
                 } else {
                     unsigned r = 0, g = 0, b = 0;
                     for (unsigned dy = 0; dy < n; ++dy)
                         for (unsigned dx = 0; dx < n; ++dx) {
-                            size_t offset = ((size_t)(y * n + dy) * (256u * n) + x * n + dx) * 4;
-                            r += pixels[offset + 2]; g += pixels[offset + 1]; b += pixels[offset];
+                            size_t offset = ((size_t)(y * n + dy) * (256u * n) + x * n + dx) * bytes;
+                            uint32_t pixel = capture_pixel(pixels + offset, bytes);
+                            r += (pixel >> 16) & 255u;
+                            g += (pixel >> 8) & 255u;
+                            b += pixel & 255u;
                         }
                     row[x * 3] = (unsigned char)(r / (n * n));
                     row[x * 3 + 1] = (unsigned char)(g / (n * n));
@@ -384,8 +402,9 @@ __attribute__((weak)) void nds_trace_3d_dispatch(void)
     if (!__atomic_load_n(&enabled, __ATOMIC_ACQUIRE)) return;
     pthread_mutex_lock(&control_mutex);
     uint64_t frame = __atomic_load_n(&nds_output_frames, __ATOMIC_RELAXED);
-    unsigned long polygons = recon_poly_band - previous_polygons;
-    previous_polygons = recon_poly_band;
+    unsigned long total = __atomic_load_n(&recon_poly_band, __ATOMIC_RELAXED);
+    unsigned long polygons = total - previous_polygons;
+    previous_polygons = total;
     if (state.first_3d == UINT64_MAX) state.first_3d = frame;
     if (state.first_geometry == UINT64_MAX && polygons >= RECON_POLY_THRESHOLD) state.first_geometry = frame;
     if (polygons > state.max_polygons) state.max_polygons = polygons;

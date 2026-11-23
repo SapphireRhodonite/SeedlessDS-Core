@@ -189,11 +189,37 @@ void gpu3d_init_color_product_tables(gpu3d_t *ctx)
 
 unsigned recon_threads_created = 4u;
 static unsigned band_ticket;
+static uint8_t band_order[GPU3D_BANDS];
+static unsigned ordered_bands;
 
 static unsigned char band_state[RECON_BAND_CAPACITY];
 __thread unsigned recon_band_current = 0xffffu;
 
-void recon_band_reset(void) { __atomic_store_n(&band_ticket, 0u, __ATOMIC_RELEASE); memset(band_state, 0, sizeof band_state); }
+void recon_band_reset(void)
+{
+    ordered_bands = 0;
+    __atomic_store_n(&band_ticket, 0u, __ATOMIC_RELEASE);
+    memset(band_state, 0, sizeof band_state);
+}
+
+void recon_band_prioritize(const gpu_t *gpu, unsigned threads)
+{
+    if (threads < 2u || recon_scale_3d != 2u || RECON_BANDS != GPU3D_BANDS ||
+        !recon_dynamic_share())
+        return;
+
+    unsigned weights[GPU3D_BANDS];
+    for (unsigned band = 0; band < GPU3D_BANDS; ++band) {
+        weights[band] = gpu->bucket[0][band].count + gpu->bucket[1][band].count;
+        unsigned slot = band;
+        while (slot && weights[band_order[slot - 1]] < weights[band]) {
+            band_order[slot] = band_order[slot - 1];
+            --slot;
+        }
+        band_order[slot] = band;
+    }
+    ordered_bands = GPU3D_BANDS;
+}
 
 void recon_band_publish(unsigned band, unsigned dirty)
 { if (band < RECON_BAND_CAPACITY) __atomic_fetch_or(&band_state[band], (unsigned char)(1u | (dirty ? 2u : 0u)), __ATOMIC_RELEASE); }
@@ -215,7 +241,10 @@ unsigned recon_band_sibling_dirty(unsigned band)
 }
 
 unsigned recon_band_take(void)
-{ return __atomic_fetch_add(&band_ticket, 1u, __ATOMIC_ACQ_REL); }
+{
+    unsigned ticket = __atomic_fetch_add(&band_ticket, 1u, __ATOMIC_ACQ_REL);
+    return ticket < ordered_bands ? band_order[ticket] : ticket;
+}
 
 unsigned recon_band_steal(unsigned h)
 { unsigned expected = h; unsigned r = __atomic_compare_exchange_n(&band_ticket, &expected, h + 1u, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED) ? 1u : 0u; return r; }

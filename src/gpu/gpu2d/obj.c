@@ -308,12 +308,24 @@ uint32_t gpu2d_obj_draw_line(gpu2d_engine_t *ctx, uint8_t *px, uint8_t *atr,
             }
         }
 
+#ifdef __ARM_NEON
+        const uint8x16_t bit_weights = {1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
+        for (i = 0; i < 256; i += 64) {
+            uint8x16_t a = vandq_u8(vcgtq_u8(vld1q_u8(padded + i), vdupq_n_u8(0)), bit_weights);
+            uint8x16_t b = vandq_u8(vcgtq_u8(vld1q_u8(padded + i + 16), vdupq_n_u8(0)), bit_weights);
+            uint8x16_t c = vandq_u8(vcgtq_u8(vld1q_u8(padded + i + 32), vdupq_n_u8(0)), bit_weights);
+            uint8x16_t d = vandq_u8(vcgtq_u8(vld1q_u8(padded + i + 48), vdupq_n_u8(0)), bit_weights);
+            uint8x16_t fours = vpaddq_u8(vpaddq_u8(a,b), vpaddq_u8(c,d));
+            vst1_u8(msk + i / 8, vpadd_u8(vget_low_u8(fours), vget_high_u8(fours)));
+        }
+#else
         for (i = 0; i < 32; i++) {
             unsigned bt = 0;
             for (b = 0; b < 8; b++)
                 if (padded[i * 8 + b]) bt |= 1u << b;
             msk[i] = (uint8_t)bt;
         }
+#endif
         ret = 16;
 
         if (layer == 0) break;
@@ -323,6 +335,17 @@ uint32_t gpu2d_obj_draw_line(gpu2d_engine_t *ctx, uint8_t *px, uint8_t *atr,
         for (i = 0; i < 32; i++) { m_bits05[i] = 0; m_bit7[i] = 0; }
     } else {
         for (i = 0; i < 32; i++) {
+#ifdef __ARM_NEON
+            const uint8x8_t weights = {1, 2, 4, 8, 16, 32, 64, 128};
+            uint8x8_t attributes = vld1_u8(atr + i * 8);
+            uint8x8_t low = vand_u8(attributes, vdup_n_u8(0x3f));
+            uint8x8_t highs = vclt_s8(vreinterpret_s8_u8(attributes), vdup_n_s8(0));
+            uint8_t mask05 = vaddv_u8(vand_u8(vcgt_u8(low, vdup_n_u8(0)), weights));
+            uint8_t mask7 = vaddv_u8(vand_u8(highs, weights));
+            vst1_u8(atr + i * 8, low);
+            m_bits05[i] = mask05;
+            m_bit7[i] = mask7;
+#else
             unsigned a05 = 0, a7 = 0;
             for (b = 0; b < 8; b++) {
                 uint8_t x = atr[i * 8 + b];
@@ -332,6 +355,7 @@ uint32_t gpu2d_obj_draw_line(gpu2d_engine_t *ctx, uint8_t *px, uint8_t *atr,
             }
             m_bits05[i] = (uint8_t)a05;
             m_bit7[i]   = (uint8_t)a7;
+#endif
         }
     }
 

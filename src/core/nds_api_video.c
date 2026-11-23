@@ -7,6 +7,7 @@
 #include "core/nds_state.h"
 #include "frontend/frontend.h"
 #include "core_internals.h"
+#include "gpu/output_color.h"
 #include "mem_access.h"
 
 #define SCREEN_WIDTH 256
@@ -28,6 +29,10 @@
 
 static uint32_t from_rgb565(uint32_t s)
 {
+    if (output_uses_color_curve()) {
+        uint32_t rgb = output_curve_rgb888((uint16_t)s);
+        return ((rgb & 255u) << 16) | (rgb & 0xff00u) | (rgb >> 16) | PIXEL_OPAQUE;
+    }
     return ((s & 0x1fu) << 3) | ((s & 0x7e0u) << 5) | ((s & 0xf800u) << 8) | PIXEL_OPAQUE;
 }
 
