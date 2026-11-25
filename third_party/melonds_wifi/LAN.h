@@ -95,7 +95,8 @@ public:
     void EndDiscovery();
     bool StartHost(const char* player, int numplayers, bool hle = false, const GroupInterface* group = nullptr,
                    ENetSocketFailure* failure = nullptr);
-    bool StartClient(const char* player, const char* host, bool hle = false, const GroupInterface* group = nullptr);
+    bool StartClient(const char* player, const char* host, bool hle = false, const GroupInterface* group = nullptr,
+                     ENetSocketFailure* failure = nullptr);
     void EndSession();
     void SetFirmwareBoot(bool firmware);
     u16 GetFirmwareBootMask() const { return FirmwareBootMask; }

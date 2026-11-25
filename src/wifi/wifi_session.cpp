@@ -410,7 +410,7 @@ static int start_session(int mode, const char* name, const char* host, const uin
     value.lan = std::make_shared<melonDS::LAN>();
     ENetSocketFailure failure{};
     bool success = mode == SEEDLESS_MP_HOST ? value.lan->StartHost(name, maximum, true, group, diagnostic ? &failure : nullptr)
-        : mode == SEEDLESS_MP_JOIN ? value.lan->StartClient(name, host, true, group) : value.lan->StartDiscovery();
+        : mode == SEEDLESS_MP_JOIN ? value.lan->StartClient(name, host, true, group, diagnostic ? &failure : nullptr) : value.lan->StartDiscovery();
     if (!success) {
         start_diagnostic(diagnostic, capacity, failure);
         value.lan.reset();

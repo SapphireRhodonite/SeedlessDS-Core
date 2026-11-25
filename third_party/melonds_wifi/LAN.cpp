@@ -362,15 +362,19 @@ bool LAN::StartHost(const char* playername, int numplayers, bool hle, const Grou
     return true;
 }
 
-bool LAN::StartClient(const char* playername, const char* host, bool hle, const GroupInterface* group)
+bool LAN::StartClient(const char* playername, const char* host, bool hle, const GroupInterface* group, ENetSocketFailure* failure)
 {
-    if (!Inited || Host) return false;
+    if (!Inited || Host)
+    {
+        enet_socket_failure_record(failure, "guest_check_state", -1);
+        return false;
+    }
     WMServiceHLE = hle;
     WMServiceSession = 0;
     WMServiceTerminal = false;
 
     ENetAddress local{group ? group->LocalAddress : ENET_HOST_ANY, 0};
-    Host = enet_host_create_on_interface(&local, 16, 2, 0, 0, group ? group->Index : 0, 0);
+    Host = enet_host_create_on_interface_report(&local, 16, 2, 0, 0, group ? group->Index : 0, 0, failure);
     if (!Host)
     {
         return false;
@@ -389,6 +393,7 @@ bool LAN::StartClient(const char* playername, const char* host, bool hle, const 
     ENetPeer* peer = enet_host_connect(Host, &addr, 2, 0);
     if (!peer)
     {
+        enet_socket_failure_record(failure, "guest_create_peer", -1);
         enet_host_destroy(Host);
         Host = nullptr;
         return false;
@@ -407,15 +412,18 @@ bool LAN::StartClient(const char* playername, const char* host, bool hle, const 
 
     ENetEvent event;
     int conn = 0;
+    int serviceResult = 0;
     u32 starttick = (u32)Platform::GetMSCount();
     const int conntimeout = 5000;
     for (;;)
     {
+        serviceResult = 0;
         u32 curtick = (u32)Platform::GetMSCount();
         if (curtick < starttick) break;
         int timeout = conntimeout - (int)(curtick - starttick);
         if (timeout < 0) break;
-        if (enet_host_service(Host, &event, timeout) > 0)
+        serviceResult = enet_host_service(Host, &event, timeout);
+        if (serviceResult > 0)
         {
             if (conn == 0 && event.type == ENET_EVENT_TYPE_CONNECT)
             {
@@ -469,7 +477,6 @@ bool LAN::StartClient(const char* playername, const char* host, bool hle, const 
             }
             else if (event.type == ENET_EVENT_TYPE_DISCONNECT)
             {
-                conn = 0;
                 break;
             }
         }
@@ -479,6 +486,7 @@ bool LAN::StartClient(const char* playername, const char* host, bool hle, const 
 
     if (conn != 2)
     {
+        enet_socket_failure_record(failure, conn == 0 ? "guest_wait_connect" : "guest_wait_session", serviceResult);
         enet_peer_reset(peer);
         enet_host_destroy(Host);
         Host = nullptr;
