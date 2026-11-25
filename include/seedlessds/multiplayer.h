@@ -19,6 +19,9 @@ int seedless_mp_start_maximum(int mode, const char *name, const char *address,
                               const uint8_t mac[6], int maximum);
 int seedless_mp_start_direct(int mode, const char *name, uint32_t local, uint32_t owner,
                             unsigned interface_index, const uint8_t mac[6], int maximum);
+int seedless_mp_start_direct_report(int mode, const char *name, uint32_t local, uint32_t owner,
+                                   unsigned interface_index, const uint8_t mac[6], int maximum,
+                                   char *diagnostic, size_t capacity);
 int seedless_mp_bind_interface(int socket_fd, unsigned interface_index);
 int seedless_mp_stop(void);
 int seedless_mp_pause(int paused);

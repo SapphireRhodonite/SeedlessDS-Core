@@ -76,13 +76,21 @@ struct SocketWake {
         pending = false;
     }
 
-    bool open()
+    bool open(ENetSocketFailure* failure)
     {
         if (descriptors[0] >= 0) return true;
-        if (pipe(descriptors) != 0) return false;
+        if (pipe(descriptors) != 0) {
+            enet_socket_failure_record(failure, "worker_pipe", errno);
+            return false;
+        }
         for (const int descriptor : descriptors) {
-            if (fcntl(descriptor, F_SETFL, O_NONBLOCK) < 0
-                || fcntl(descriptor, F_SETFD, FD_CLOEXEC) < 0) {
+            if (fcntl(descriptor, F_SETFL, O_NONBLOCK) < 0) {
+                enet_socket_failure_record(failure, "worker_pipe_nonblock", errno);
+                close();
+                return false;
+            }
+            if (fcntl(descriptor, F_SETFD, FD_CLOEXEC) < 0) {
+                enet_socket_failure_record(failure, "worker_pipe_cloexec", errno);
                 close();
                 return false;
             }
@@ -362,35 +370,57 @@ int conservative_ack(void* context)
 }
 }
 
+static void start_diagnostic(char* output, size_t capacity, const ENetSocketFailure& failure)
+{
+    if (!output || !capacity || !failure.operation) return;
+    if (failure.retryOperation)
+        std::snprintf(output, capacity, "operation=%s code=%d retry_operation=%s retry_code=%d",
+                      failure.operation, failure.code, failure.retryOperation, failure.retryCode);
+    else
+        std::snprintf(output, capacity, "operation=%s code=%d", failure.operation, failure.code);
+}
+
 static int start_session(int mode, const char* name, const char* host, const uint8_t mac[6],
-                         int maximum, const melonDS::LAN::GroupInterface* group)
+                         int maximum, const melonDS::LAN::GroupInterface* group,
+                         char* diagnostic = nullptr, size_t capacity = 0)
 {
     if (mode < SEEDLESS_MP_HOST || mode > SEEDLESS_MP_DISCOVER || !name || !host || !mac || maximum < 2 || maximum > 16
-        || std::strlen(name) > 31 || std::strlen(host) > 253 || (mac[0] & 1)) return -1;
+        || std::strlen(name) > 31 || std::strlen(host) > 253 || (mac[0] & 1)) {
+        start_diagnostic(diagnostic, capacity, {"native_validate_arguments", -1, nullptr, 0});
+        return -1;
+    }
     auto& value = session();
     std::lock_guard<std::mutex> lifecycle(value.lifecycle);
-    if (value.game) return -2;
+    if (value.game) {
+        start_diagnostic(diagnostic, capacity, {"native_check_game", -2, nullptr, 0});
+        return -2;
+    }
     value.stop();
     std::lock_guard<std::mutex> lock(value.mutex);
 #ifdef __ANDROID__
     char policy[PROP_VALUE_MAX]{};
     if (mode != SEEDLESS_MP_DISCOVER && __system_property_get("debug.seedlessds.wm_hle", policy)
         && std::strcmp(policy, "0") == 0) {
+        start_diagnostic(diagnostic, capacity, {"native_check_wireless_policy", -3, nullptr, 0});
         value.error = "Wireless support is disabled for this multiplayer room.";
         value.update();
         return -3;
     }
 #endif
     value.lan = std::make_shared<melonDS::LAN>();
-    bool success = mode == SEEDLESS_MP_HOST ? value.lan->StartHost(name, maximum, true, group)
+    ENetSocketFailure failure{};
+    bool success = mode == SEEDLESS_MP_HOST ? value.lan->StartHost(name, maximum, true, group, diagnostic ? &failure : nullptr)
         : mode == SEEDLESS_MP_JOIN ? value.lan->StartClient(name, host, true, group) : value.lan->StartDiscovery();
     if (!success) {
+        start_diagnostic(diagnostic, capacity, failure);
         value.lan.reset();
         value.error = "Could not open the multiplayer session. Check the address and local network.";
         value.update();
         return -3;
     }
-    if (!value.socket_wake.open()) {
+    failure = {};
+    if (!value.socket_wake.open(diagnostic ? &failure : nullptr)) {
+        start_diagnostic(diagnostic, capacity, failure);
         value.lan.reset();
         value.error = "Could not open the multiplayer worker signal.";
         value.update();
@@ -424,10 +454,21 @@ extern "C" int seedless_mp_start_maximum(int mode, const char* name, const char*
 extern "C" int seedless_mp_start_direct(int mode, const char* name, uint32_t local, uint32_t owner,
                                        unsigned interface_index, const uint8_t mac[6], int maximum)
 {
+    return seedless_mp_start_direct_report(mode, name, local, owner, interface_index, mac, maximum, nullptr, 0);
+}
+
+extern "C" int seedless_mp_start_direct_report(int mode, const char* name, uint32_t local, uint32_t owner,
+                                              unsigned interface_index, const uint8_t mac[6], int maximum,
+                                              char* diagnostic, size_t capacity)
+{
+    if (diagnostic && capacity) diagnostic[0] = '\0';
     if ((mode != SEEDLESS_MP_HOST && mode != SEEDLESS_MP_JOIN) || !local || !owner || !interface_index
-        || (mode == SEEDLESS_MP_HOST) != (local == owner)) return -1;
+        || (mode == SEEDLESS_MP_HOST) != (local == owner)) {
+        start_diagnostic(diagnostic, capacity, {"native_validate_route", -1, nullptr, 0});
+        return -1;
+    }
     const melonDS::LAN::GroupInterface group{local, owner, interface_index};
-    return start_session(mode, name, "", mac, maximum, &group);
+    return start_session(mode, name, "", mac, maximum, &group, diagnostic, capacity);
 }
 
 extern "C" int seedless_mp_bind_interface(int socket_fd, unsigned interface_index)

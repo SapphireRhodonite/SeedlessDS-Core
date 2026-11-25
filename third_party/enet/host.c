@@ -3,6 +3,7 @@
  @brief ENet host management functions
 */
 #define ENET_BUILDING_LIB 1
+#include <errno.h>
 #include <string.h>
 #include "enet/enet.h"
 #ifdef __ANDROID__
@@ -11,19 +12,26 @@
 #endif
 
 static int
-enet_bind_host_interface (ENetSocket socket, const ENetAddress * address, unsigned index, int allowAddressBoundListener)
+enet_bind_host_interface (ENetSocket socket, const ENetAddress * address, unsigned index, int allowAddressBoundListener,
+                          ENetSocketFailure * failure)
 {
-    const int result = enet_socket_bind_interface (socket, index);
 #ifdef __ANDROID__
+    const int result = enet_socket_bind_interface_report (socket, index, failure);
     if (result == ENET_INTERFACE_BIND_PERMISSION_DENIED && allowAddressBoundListener &&
         address != NULL && address -> host != ENET_HOST_ANY)
     {
        const enet_uint32 outputInterface = htonl (index);
-       return setsockopt (socket, IPPROTO_IP, IP_UNICAST_IF, &outputInterface, sizeof (outputInterface));
+       const int bound = setsockopt (socket, IPPROTO_IP, IP_UNICAST_IF, &outputInterface, sizeof (outputInterface));
+       if (bound < 0)
+         enet_socket_failure_record (failure, "udp_set_output_interface", errno);
+       return bound;
     }
 #else
     (void) address;
     (void) allowAddressBoundListener;
+    const int result = enet_socket_bind_interface (socket, index);
+    if (result < 0)
+      enet_socket_failure_record (failure, "udp_bind_interface", result);
 #endif
     return result;
 }
@@ -57,20 +65,36 @@ ENetHost *
 enet_host_create_on_interface (const ENetAddress * address, size_t peerCount, size_t channelLimit,
                                enet_uint32 incomingBandwidth, enet_uint32 outgoingBandwidth, unsigned interfaceIndex, int allowAddressBoundListener)
 {
+    return enet_host_create_on_interface_report (address, peerCount, channelLimit, incomingBandwidth,
+                                                  outgoingBandwidth, interfaceIndex, allowAddressBoundListener, NULL);
+}
+
+ENetHost *
+enet_host_create_on_interface_report (const ENetAddress * address, size_t peerCount, size_t channelLimit,
+                                      enet_uint32 incomingBandwidth, enet_uint32 outgoingBandwidth, unsigned interfaceIndex,
+                                      int allowAddressBoundListener, ENetSocketFailure * failure)
+{
     ENetHost * host;
     ENetPeer * currentPeer;
 
     if (peerCount > ENET_PROTOCOL_MAXIMUM_PEER_ID)
+    {
+      enet_socket_failure_record (failure, "udp_validate_peers", EINVAL);
       return NULL;
+    }
 
     host = (ENetHost *) enet_malloc (sizeof (ENetHost));
     if (host == NULL)
+    {
+      enet_socket_failure_record (failure, "udp_allocate_host", ENOMEM);
       return NULL;
+    }
     memset (host, 0, sizeof (ENetHost));
 
     host -> peers = (ENetPeer *) enet_malloc (peerCount * sizeof (ENetPeer));
     if (host -> peers == NULL)
     {
+       enet_socket_failure_record (failure, "udp_allocate_peers", ENOMEM);
        enet_free (host);
 
        return NULL;
@@ -78,13 +102,21 @@ enet_host_create_on_interface (const ENetAddress * address, size_t peerCount, si
     memset (host -> peers, 0, peerCount * sizeof (ENetPeer));
 
     host -> socket = enet_socket_create (ENET_SOCKET_TYPE_DATAGRAM);
-    if (host -> socket == ENET_SOCKET_NULL ||
-        (interfaceIndex && enet_bind_host_interface (host -> socket, address, interfaceIndex, allowAddressBoundListener) < 0) ||
-        (address != NULL && enet_socket_bind (host -> socket, address) < 0))
+    if (host -> socket == ENET_SOCKET_NULL)
+      enet_socket_failure_record (failure, "udp_socket", errno);
+    else if (interfaceIndex && enet_bind_host_interface (host -> socket, address, interfaceIndex, allowAddressBoundListener, failure) < 0)
     {
-       if (host -> socket != ENET_SOCKET_NULL)
-         enet_socket_destroy (host -> socket);
-
+       enet_socket_destroy (host -> socket);
+       host -> socket = ENET_SOCKET_NULL;
+    }
+    else if (address != NULL && enet_socket_bind (host -> socket, address) < 0)
+    {
+       enet_socket_failure_record (failure, "udp_bind", errno);
+       enet_socket_destroy (host -> socket);
+       host -> socket = ENET_SOCKET_NULL;
+    }
+    if (host -> socket == ENET_SOCKET_NULL)
+    {
        enet_free (host -> peers);
        enet_free (host);
 

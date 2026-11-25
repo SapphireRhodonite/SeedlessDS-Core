@@ -309,10 +309,18 @@ void LAN::EndDiscovery()
         Active = false;
 }
 
-bool LAN::StartHost(const char* playername, int numplayers, bool hle, const GroupInterface* group)
+bool LAN::StartHost(const char* playername, int numplayers, bool hle, const GroupInterface* group, ENetSocketFailure* failure)
 {
-    if (!Inited) return false;
-    if (numplayers < 2 || numplayers > 16 || Host) return false;
+    if (!Inited)
+    {
+        enet_socket_failure_record(failure, "enet_initialize", -1);
+        return false;
+    }
+    if (numplayers < 2 || numplayers > 16 || Host)
+    {
+        enet_socket_failure_record(failure, "enet_host_state", -1);
+        return false;
+    }
     WMServiceHLE = hle;
     WMServiceSession = NewWMSession();
     WMServiceTerminal = false;
@@ -321,7 +329,7 @@ bool LAN::StartHost(const char* playername, int numplayers, bool hle, const Grou
     addr.host = group ? group->LocalAddress : ENET_HOST_ANY;
     addr.port = kLANPort;
 
-    Host = enet_host_create_on_interface(&addr, 16, 2, 0, 0, group ? group->Index : 0, group != nullptr);
+    Host = enet_host_create_on_interface_report(&addr, 16, 2, 0, 0, group ? group->Index : 0, group != nullptr, failure);
     if (!Host)
     {
         return false;

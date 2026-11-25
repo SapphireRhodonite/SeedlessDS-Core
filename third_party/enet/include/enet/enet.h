@@ -498,7 +498,34 @@ ENET_API void enet_time_set (enet_uint32);
 */
 ENET_API ENetSocket enet_socket_create (ENetSocketType);
 #define ENET_INTERFACE_BIND_PERMISSION_DENIED (-2)
+typedef struct _ENetSocketFailure
+{
+    const char * operation;
+    int code;
+    const char * retryOperation;
+    int retryCode;
+} ENetSocketFailure;
+
+static inline void enet_socket_failure_record (ENetSocketFailure * failure, const char * operation, int code)
+{
+    if (!failure)
+        return;
+    if (!failure -> operation)
+    {
+        failure -> operation = operation;
+        failure -> code = code;
+    }
+    else if (!failure -> retryOperation)
+    {
+        failure -> retryOperation = operation;
+        failure -> retryCode = code;
+    }
+}
+
 ENET_API int        enet_socket_bind_interface (ENetSocket, unsigned);
+#ifdef __ANDROID__
+ENET_API int        enet_socket_bind_interface_report (ENetSocket, unsigned, ENetSocketFailure *);
+#endif
 ENET_API int        enet_socket_bind (ENetSocket, const ENetAddress *);
 ENET_API int        enet_socket_get_address (ENetSocket, ENetAddress *);
 ENET_API int        enet_socket_listen (ENetSocket, int);
@@ -567,6 +594,7 @@ ENET_API int          enet_packet_resize  (ENetPacket *, size_t);
 ENET_API enet_uint32  enet_crc32 (const ENetBuffer *, size_t);
                 
 ENET_API ENetHost * enet_host_create_on_interface (const ENetAddress *, size_t, size_t, enet_uint32, enet_uint32, unsigned, int);
+ENET_API ENetHost * enet_host_create_on_interface_report (const ENetAddress *, size_t, size_t, enet_uint32, enet_uint32, unsigned, int, ENetSocketFailure *);
 ENET_API ENetHost * enet_host_create (const ENetAddress *, size_t, size_t, enet_uint32, enet_uint32);
 ENET_API void       enet_host_destroy (ENetHost *);
 ENET_API ENetPeer * enet_host_connect (ENetHost *, const ENetAddress *, size_t, enet_uint32);

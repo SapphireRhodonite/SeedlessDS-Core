@@ -245,25 +245,54 @@ enet_address_get_host (const ENetAddress * address, char * name, size_t nameLeng
     return enet_address_get_host_ip (address, name, nameLength);
 }
 
-int
-enet_socket_bind_interface (ENetSocket socket, unsigned index)
+static int
+bind_interface (ENetSocket socket, unsigned index, ENetSocketFailure * failure)
 {
 #if defined(SO_BINDTODEVICE)
     char name [IF_NAMESIZE];
-    if (!index || !if_indextoname (index, name))
+    if (!index)
+    {
+      enet_socket_failure_record (failure, "udp_resolve_interface", EINVAL);
       return -1;
+    }
+    if (!if_indextoname (index, name))
+    {
+      enet_socket_failure_record (failure, "udp_resolve_interface", errno);
+      return -1;
+    }
     const int result = setsockopt (socket, SOL_SOCKET, SO_BINDTODEVICE, name, strlen (name) + 1);
+    if (result < 0)
+    {
+      const int error = errno;
+      enet_socket_failure_record (failure, "udp_bind_interface", error);
 #ifdef __ANDROID__
-    if (result < 0 && errno == EPERM)
-      return ENET_INTERFACE_BIND_PERMISSION_DENIED;
+      if (error == EPERM)
+        return ENET_INTERFACE_BIND_PERMISSION_DENIED;
 #endif
+    }
     return result;
 #elif defined(IP_BOUND_IF)
+    (void) failure;
     return index ? setsockopt (socket, IPPROTO_IP, IP_BOUND_IF, &index, sizeof (index)) : -1;
 #else
+    (void) failure;
     return -1;
 #endif
 }
+
+int
+enet_socket_bind_interface (ENetSocket socket, unsigned index)
+{
+    return bind_interface (socket, index, NULL);
+}
+
+#ifdef __ANDROID__
+int
+enet_socket_bind_interface_report (ENetSocket socket, unsigned index, ENetSocketFailure * failure)
+{
+    return bind_interface (socket, index, failure);
+}
+#endif
 
 int
 enet_socket_bind (ENetSocket socket, const ENetAddress * address)
