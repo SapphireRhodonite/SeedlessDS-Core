@@ -124,7 +124,8 @@ foreach(source common/conv.c common/crc32.c common/stream.c common/unarr.c
 endforeach()
 add_library(seedless_unarr STATIC ${SEEDLESS_UNARR_SRC})
 target_compile_definitions(seedless_unarr PRIVATE _POSIX_C_SOURCE=200809L NDEBUG HAVE_ZLIB USE_ZLIB_CRC)
-target_compile_options(seedless_unarr PRIVATE -O2 -fPIC -ffunction-sections -fdata-sections)
+target_compile_options(seedless_unarr PRIVATE -O2 -fPIC -ffunction-sections -fdata-sections
+    "-fmacro-prefix-map=${SEEDLESS_UNARR_DIR}=unarr")
 target_link_libraries(seedless_unarr PRIVATE z)
 target_include_directories(seedless_unarr PUBLIC "${SEEDLESS_UNARR_DIR}")
 set_target_properties(seedless_unarr PROPERTIES C_VISIBILITY_PRESET hidden)
